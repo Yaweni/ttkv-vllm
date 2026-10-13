@@ -69,6 +69,26 @@ def _build(args):
     # one batch's shapes against another's data -- so asking for it there is refused rather than
     # silently ignored.
     graphs = bool(getattr(args, "graphs", False))
+    chunked = bool(getattr(args, "chunked", False))
+    # CHUNKED PREFILL AND PREFIX CACHING ARE DECOUPLED ON PURPOSE, and the reason is a measurement
+    # one rather than a capability one. Both can schedule a continuation chunk, but prefix caching
+    # ALSO makes the harness's second generation re-use the first call's KV -- so with it on, the
+    # two calls differ by a whole prefill and the decode rate (a DIFFERENCE of two runs) comes out
+    # NEGATIVE. Measured: -1.4, -1.5, -0.1, -0.1 tok/s at N=1,2,4,8, against -prefill_s almost
+    # exactly. So `--chunked` alone is the setting that exercises the continuation path AND leaves
+    # the decode number meaningful.
+    prefix = bool(getattr(args, "prefix_cache", False))
+    # THE TOKEN BUDGET IS WHAT DECIDES WHETHER A CONTINUATION HAPPENS AT ALL, and a continuation is
+    # ~8x the per-token cost of a first chunk on the ttkv arm (measured: 1070 tok/s at N=2 where the
+    # batch fits one chunk, 108 tok/s at N=8 where it does not). So it is a flag rather than a
+    # constant: a sweep at a batch that does not fit tells you about the continuation path, and one
+    # at a budget that does fit tells you about the format. Both are wanted, at different times.
+    budget = int(getattr(args, "max_num_batched_tokens", 0) or 16384)
+    if budget < 16384:
+        raise SystemExit(
+            f"--max-num-batched-tokens={budget} is below max_model_len=16384, which pydantic "
+            f"refuses: a smaller batched-token budget would cap the sequence length below what "
+            f"`max_model_len` was asked for.")
     if graphs and args.arm == "ttkv":
         raise SystemExit(
             "--graphs cannot apply to the ttkv arm: the impl is host-interactive (`.tolist()` batch "
@@ -102,19 +122,25 @@ def _build(args):
         # `TTKVAttentionMetadataBuilder` inherits `AttentionCGSupport.NEVER`. `--graphs` on the
         # BASELINE arm is how much that costs, measured rather than asserted.
         enforce_eager=not graphs,
-        # The prefill branch refuses a continuation chunk (a multi-query `krt` is the missing
-        # piece), so the first chunk has to be the whole prompt -- and a chunked step is refused
-        # loudly by `_prefill` rather than silently attending over the chunk alone.
-        enable_chunked_prefill=False,
-        # AND PREFIX CACHING IS OFF FOR THE SAME REASON, which is a deployment constraint rather than
-        # a test setting: a request whose prompt matches a cached prefix is scheduled as the NEW
-        # tokens only, i.e. exactly the continuation chunk above. Left on, the second request with a
-        # recognisable prompt takes the engine down with a correct refusal. There is no wrong answer
-        # here either way -- only a choice between refusing and a multi-query `krt`.
-        enable_prefix_caching=False,
+        # CHUNKED PREFILL AND PREFIX CACHING WERE REFUSED HERE UNTIL THE MULTI-QUERY `krt` EXISTED,
+        # because both can schedule a CONTINUATION chunk -- a request with keys already in the store
+        # and only a few new query tokens. The single-query kernel contracts one query row per (kv
+        # head, group) and returns `[HQ, n]`, so it could not express that; a continuation used to
+        # take the engine down with a correct refusal. `_prefill` now reads the whole store through
+        # `krt_multi_from_slots`, so both are available.
+        #
+        # THEY STAY OFF BY DEFAULT ANYWAY, and not out of caution: the recorded prefill and
+        # decode-vs-context numbers were taken without them, and a split prefill is a DIFFERENT
+        # measurement -- the fit lands on the first chunk of a different size, and `_prefill` takes
+        # a different branch. `--chunked` turns on chunked prefill; see `prefix` above for why
+        # prefix caching is a separate flag.
+        enable_chunked_prefill=chunked,
+        # DECOUPLED FROM `--chunked` -- see `prefix` above. Turning it on makes the second
+        # generation hit the cache, so the harness's decode difference stops measuring decode.
+        enable_prefix_caching=prefix,
         # At least `max_model_len`, which pydantic enforces: a smaller batched-token budget would
-        # cap the sequence length below what was asked for.
-        max_num_batched_tokens=16384,
+        # cap the sequence length below what was asked for. See `budget` above for why it is a knob.
+        max_num_batched_tokens=budget,
         **kw,
     )
 
@@ -192,6 +218,10 @@ def main() -> int:
                          "wall time is then the prompt's forward pass plus one decode step, which is "
                          "the only way to separate a prefill regression from a decode one in this "
                          "harness's single `generate_s` number")
+    ap.add_argument("--chunked", action="store_true",
+                    help="enable chunked prefill AND prefix caching, both of which schedule "
+                         "continuation chunks. Available now that the multi-query `krt` exists; off "
+                         "by default because the recorded prefill numbers were taken without them")
     args = ap.parse_args()
 
     if args.compare:

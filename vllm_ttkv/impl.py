@@ -52,11 +52,11 @@ from vllm.v1.attention.backend import AttentionImpl
 
 from vllm_ttkv import decode as dc
 from vllm_ttkv import prof
-from vllm_ttkv.krt_triton import krt_from_slots
+from vllm_ttkv.krt_triton import krt_from_slots, krt_multi_from_slots
 from vllm_ttkv.rope_store import (calibration_info, decoder_for_layer, decoder_for_request,
                                   ensure_store, layout_for_layer, register_decoder, request_key,
                                   request_key_host, store_for_layer)
-from vllm_ttkv.v_out_triton import v_out_from_slots
+from vllm_ttkv.v_out_triton import v_out_from_slots, v_out_multi_from_slots
 
 try:                                                      # present in backend.py, but not load-bearing
     from vllm.v1.attention.backend import AttentionType
@@ -466,15 +466,21 @@ class TTKVAttentionImpl(AttentionImpl):
             # the fallback is allowed there and refused beyond it.
             fallback = self._single_request_decoder(layer) if len(plan.decodes) == 1 else None
             for r in plan.decodes:
-                key = step.key(r)
-                kdec = decoder_for_request(layer_name, key)
+                # `req_key`, NOT `key`: this loop used to assign `key = step.key(r)`, which SHADOWS
+                # the `key` parameter of `forward` -- so the prefill branch below was handed a
+                # request key (an int) instead of the key tensor, and failed on `key[start:end]`.
+                # It never fired while a step was either all-decode or all-prefill; a MIXED batch,
+                # which is what chunked prefill with more than one request produces, is what exposes
+                # it. `test_a_mixed_batch_of_decodes_and_prefills_uses_both_paths` pins it.
+                req_key = step.key(r)
+                kdec = decoder_for_request(layer_name, req_key)
                 decoder_f = kdec.decoder_f if kdec is not None else fallback
                 if decoder_f is None:
                     decoder_f = fallback
                 if decoder_f is None:
                     raise RuntimeError(
-                        f"no fitted TT-KV decoder for request {key} in layer {layer_name!r}, and "
-                        f"{len(plan.decodes)} requests are decoding. A decoder belongs to a "
+                        f"no fitted TT-KV decoder for request {req_key} in layer {layer_name!r}, "
+                        f"and {len(plan.decodes)} requests are decoding. A decoder belongs to a "
                         f"SEQUENCE, not to a layer: it is that sequence's own TT-SVD fit, and a "
                         f"rank-r1 basis spanning several requests has to cover their combined key "
                         f"diversity. Register it with "
@@ -487,7 +493,7 @@ class TTKVAttentionImpl(AttentionImpl):
                 output[plan.qsl[r]] = row.to(output.dtype)
 
         if plan.prefills:
-            self._prefill(query, key, value, plan, output)
+            self._prefill(layer, lay, cache, step, query, key, value, plan, output)
 
         return output
 
@@ -642,26 +648,101 @@ class TTKVAttentionImpl(AttentionImpl):
         return csc
 
     # ------------------------------------------------------------------ the prefill branch
-    def _prefill(self, query, key, value, plan, output):
+    def _prefill(self, layer, lay, cache, step, query, key, value, plan, output):
+        """Multi-token requests, by the cheapest CORRECT route -- and which route that is depends on
+        whether the request already has context.
+
+        TWO CASES, AND THEY ARE GENUINELY DIFFERENT
+
+        * `seq_len == q_len`: the FIRST chunk. The model handed us this chunk's own post-RoPE
+          `key`/`value`, so attending over them directly is the same attention every other backend
+          runs (TurboQuant's prefill does the same thing). Reading the store here would mean
+          rotating reconstructed raw keys forward only to contract them against queries the model
+          already rotated -- strictly more work for the same answer.
+        * `seq_len > q_len`: a CONTINUATION chunk (chunked prefill, or a prefix-cache hit). The
+          request has `seq_len - q_len` keys in the store from earlier steps, and this branch only
+          sees the current batch. Attending over the chunk alone would SILENTLY DROP every one of
+          those keys -- a confident wrong answer, which is why this used to be refused outright.
+
+        THE REFUSAL IS GONE BECAUSE THE KERNEL EXISTS. A single-query `krt` contracts one query row
+        per (kv head, group) and returns `[HQ, n]`, so it cannot express `q_len` queries over the
+        same `n` rows; `krt_multi_from_slots` can, and it reconstructs each stored row ONCE for all
+        `q_len` queries rather than once per query. So the continuation is now computed over the
+        whole store, and the row count is checked rather than assumed.
+        """
         for r in plan.prefills:
             start, end = plan.qsl[r], plan.qsl[r + 1]
             q_len = end - start
             seq_len = int(plan.seq_lens[r])
-            if seq_len > q_len:
-                raise NotImplementedError(
-                    f"request {r} has seq_len={seq_len} but only q_len={q_len} query tokens, so it "
-                    f"has {seq_len - q_len} keys in the store from earlier steps. This prefill "
-                    f"branch only sees the CURRENT batch, so attending here would drop every one of "
-                    f"those keys -- a wrong answer with no error. A continuation chunk needs a "
-                    f"MULTI-QUERY `krt`: the current kernel contracts one query row per (kv head, "
-                    f"group) row and returns `[HQ, n]`, so it cannot express `q_len` queries over "
-                    f"the same n rows. Until that kernel exists, run with `enable_chunked_prefill` "
-                    f"off, or with `max_num_batched_tokens` at least the longest prompt so the "
-                    f"first chunk is the whole prompt.")
-            output[start:end] = self._sdpa(
-                query[start:end].to(torch.float32),
-                key[start:end].to(torch.float32),
-                value[start:end].to(torch.float32)).to(output.dtype)
+            if seq_len < q_len:
+                raise RuntimeError(
+                    f"request {r} has seq_len={seq_len} but {q_len} query tokens in this step, so "
+                    f"the store holds FEWER rows than the step has queries. The store is written "
+                    f"before attention in the same `forward`, so this cannot be a first chunk -- it "
+                    f"means the slot mapping and the sequence length disagree.")
+            if seq_len == q_len:
+                output[start:end] = self._sdpa(
+                    query[start:end].to(torch.float32),
+                    key[start:end].to(torch.float32),
+                    value[start:end].to(torch.float32)).to(output.dtype)
+                continue
+            self._prefill_continuation(layer, lay, cache, step, query, plan, r, start, end,
+                                      seq_len, output)
+
+    def _prefill_continuation(self, layer, lay, cache, step, query, plan, r, start, end, seq_len,
+                              output):
+        """A chunk that has EARLIER keys in the store: multi-query `krt` over the whole store.
+
+        The store holds one row per stored token and its addressing is token-major, so the rows this
+        request may attend come from `step.slots(r)` and their own positions come from the angle
+        table -- and `p0 = seq_len - q_len` is the absolute position of the chunk's first query, so
+        causality is `row <= p0 + j`. Nothing here needs the model's `key`/`value`: the values come
+        out of the store, which is the whole point of storing them.
+
+        THE READOUT IS QUERY-BLOCKED TOO, and for a measured reason rather than symmetry. The
+        per-query `v_out_from_slots` returns `[HQ, d]`, so a chunk of `q_len` queries costs `q_len`
+        launches -- 5753 of them a layer on a 4-prompt continuation -- and because its contraction
+        is `[GP, KT] x [KT, HALF]` the only dimension that can clear `tl.dot`'s minimum of 16 is the
+        GROUP axis, which it pads from `G=4` to 16. Moving the query axis into `M` fixes both at
+        once: one launch per chunk, and `M = BQ*GP` clears 16 with no padding at all.
+        """
+        layer_name = getattr(layer, "layer_name", None)
+        store = store_for_layer(layer_name)
+        if store is None:
+            raise RuntimeError(
+                f"no TT-KV store for layer {layer_name!r}, so there is no angle table to read and "
+                f"no rows to attend over. It is created by the writer on this layer's first chunk.")
+        kdec = decoder_for_request(layer_name, step.key(r))
+        decoder_f = kdec.decoder_f if kdec is not None else self._single_request_decoder(layer)
+        if decoder_f is None:
+            raise RuntimeError(
+                f"request {step.key(r)} has seq_len={seq_len} but no fitted decoder in layer "
+                f"{layer_name!r}, so there is no basis to read its stored rows against. That means "
+                f"its first chunk never reached the writer -- a continuation cannot be decoded "
+                f"without the fit that its first chunk produced.")
+        dc.check_layout_matches_decoder(lay, decoder_f)
+
+        q_len = end - start
+        slots = step.slots(r, query.device)
+        blob = dc.gather_slots(cache, slots, lay.compressed_bytes_per_token(), check=False)
+        k_slots, v_slots = dc.split_blob(lay, blob)
+        cos, sin = step.angles(store.cos_sin_cache, seq_len, self.head_size, query.device)
+        dc.check_row_counts(k_slots.shape[0], v_slots.shape[0], cos.shape[0], seq_len)
+
+        # `[q_len, HQ, d]` -> `[HQ, q_len, d]`: the kernel takes the query head-major, the same
+        # convention as the scores it returns. Getting this wrong is not a shape error -- the
+        # launcher derives the group size from `q.shape[0]`, so a swapped axis changes `G` and
+        # returns scores of the right shape for the wrong heads.
+        q = query[start:end].permute(1, 0, 2).contiguous().to(torch.float32)
+        scores = krt_multi_from_slots(lay, k_slots, decoder_f, cos, sin, q, p0=seq_len - q_len)
+        p = torch.softmax(scores * self.scale, dim=-1)                 # [HQ, q_len, seq_len]
+        # ONE launch for the whole chunk, not `q_len` of them. The masked positions are already
+        # exactly zero here -- softmaxing a `-inf` score gives 0 -- so the readout needs no causal
+        # argument, and a zero weight contributes a zero row. `v_out_multi_from_slots` also drops
+        # the group padding the single-query kernel needs, because the query axis clears `tl.dot`'s
+        # minimum `M` on its own.
+        out = v_out_multi_from_slots(lay, v_slots, p)                  # [HQ, q_len, d]
+        output[start:end] = out.permute(1, 0, 2).to(output.dtype)      # [q_len, HQ, d]
 
     # ------------------------------------------------------------------ kernel shims
     def _krt(self, lay, k_slots, decoder_f, q, cos, sin):

@@ -44,7 +44,8 @@ from vllm_ttkv import patch                                            # noqa: E
 from vllm_ttkv.encode import KDecoder                                  # noqa: E402
 from vllm_ttkv.impl import TTKVAttentionImpl                           # noqa: E402
 from vllm_ttkv.layout import TTKLayout, layout_for_config, pack_k_slots, pack_v_slots  # noqa: E402
-from vllm_ttkv.reference import attend_raw_store, dense_from_slots     # noqa: E402
+from vllm_ttkv.reference import (attend_raw_store, dense_from_slots,  # noqa: E402
+                                 dense_v_from_slots, raw_scores_multi)
 from vllm_ttkv.rope_store import (TTKVRopeStore, clear_decoders, decoder_for_request,  # noqa: E402
                                   register_decoder, request_key, store_for_layer, CONFIG_ENV)
 
@@ -727,16 +728,105 @@ def test_two_layers_of_one_step_each_write_their_own_store():
     print("  two layers, one metadata object: both stores created, neither skipped")
 
 
-def test_continuation_prefill_refuses_rather_than_dropping_context():
-    """THE GUARD THAT MATTERS MOST FOR SERVING. A chunked-prefill continuation arrives with
-    `seq_len > q_len`: the request already has keys in the store. This branch only sees the current
-    batch, so attending here would drop all of them and return a confident wrong answer. The refusal
-    names the missing kernel rather than the symptom."""
+def _ref_prefill_multi(lay, ks, vs, dec, q_perm, cos, sin, scale, p0):
+    """Reference for a continuation chunk: attention over the WHOLE store, `[q_len, HQ, d]`.
+
+    Written in a different index order from the kernel's call site on purpose -- `[HQ, q_len, n]`
+    with the softmax on the last axis, GQA expanded explicitly through `dense_v_from_slots` -- so
+    agreement tests the ordering rather than a shared assumption.
+    """
+    s = raw_scores_multi(lay, ks, dec, q_perm, cos, sin, scale=scale, p0=p0)   # [HQ, Q, n]
+    p = torch.softmax(s, dim=-1)
+    V = dense_v_from_slots(lay, vs)                                   # [H, n, d]
+    p_all = torch.arange(HQ, device=q_perm.device) // G
+    return torch.einsum("hqp,phd->qhd", p, V.permute(1, 0, 2)[:, p_all, :])
+
+
+def test_continuation_prefill_matches_attention_over_the_whole_store():
+    """THE CASE THIS BRANCH USED TO REFUSE, now computed -- and it is the guard that matters most
+    for serving.
+
+    A chunked-prefill continuation (or a prefix-cache hit) arrives with `seq_len > q_len`: the
+    request already has keys in the store. Attending over the current chunk alone would SILENTLY DROP
+    all of them, so this used to raise. It now reads the whole store through the multi-query `krt`,
+    and this test pins that the answer is the attention over all 40 stored rows and not just the 8
+    query tokens' own rows.
+
+    THE STORE IS BUILT BY HAND AND THE WRITE IS SKIPPED (`_run` does that), because letting the impl
+    re-encode would place the 8 new tokens at the fixture's `slot_mapping` and overwrite rows the
+    continuation is supposed to read -- the test would then be comparing the impl against itself.
+    `write=True` on `_world` is therefore REQUIRED, not incidental: it is what puts the known blob in
+    the cache in the first place, and `write=False` leaves the cache all zeros so the read returns
+    zeros and the reference does not. The first version of this test had that backwards and failed
+    with a relative error of exactly 1.0, which is the signature of reading an empty store.
+    """
     if not _need_cuda():
         return
-    impl, layer, cache, md, q, _pr, _csc = _world([40], q_lens=[8])   # 8 query tokens, 40 stored
-    with pytest.raises(NotImplementedError, match="MULTI-QUERY"):
-        _run(impl, layer, cache, md, q)
+    impl, layer, cache, md0, q, per_req, csc = _world([40], q_lens=[8])
+    pr = per_req[0]
+    lay = pr["lay"]
+    # A continuation's new tokens occupy the SLOTS OF THEIR OWN POSITIONS: rows 32..39. The
+    # fixture's default `slot_mapping` is `arange(sum(seq_lens))`, which is a first chunk's mapping.
+    md = _MD([8], [40], md0.block_table, slot_mapping=pr["slots"][32:40])
+    got = _run(impl, layer, cache, md, q)
+
+    n = 40
+    cos, sin = dc.cos_sin_from_cache(csc, torch.arange(n, device=DEV), D, max_position=n - 1)
+    want = _ref_prefill_multi(lay, pr["ks"], pr["vs"], pr["dec"], q.permute(1, 0, 2).contiguous(),
+                              cos, sin, D ** -0.5, p0=n - 8)
+    rel = ((got - want).abs().max() / want.abs().max()).item()
+    print(f"  continuation chunk (8 queries over 40 stored rows): rel err {rel:.3e}")
+
+    # AND THE NEGATIVE CONTROL, because a wrong answer here is the silent kind: attending over the
+    # chunk's own rows only is what the refusal existed to prevent, so it has to differ materially.
+    only_own = _ref_prefill_multi(lay, pr["ks"][32:], pr["vs"][32:], pr["dec"],
+                                  q.permute(1, 0, 2).contiguous(),
+                                  cos[32:], sin[32:], D ** -0.5, p0=7)
+    dropped = ((want - only_own).abs().max() / want.abs().max()).item()
+    print(f"  dropping the 32 earlier keys changes the answer by {dropped:.3f} (relative)")
+    assert dropped > 1e-2, (
+        f"attending over the chunk's own rows differs from the whole store by only {dropped:.2e}, "
+        f"so this test would pass even if the earlier keys were dropped")
+    assert rel < 1e-4, (
+        f"the continuation disagrees with attention over the whole store by {rel:.3e}. A dropped "
+        f"key changes the softmax denominator and every weight in it, and nothing else would say so")
+
+
+def test_a_mixed_batch_of_decodes_and_prefills_uses_both_paths():
+    """A step holding BOTH a decode and a prefill, which is the shape chunked prefill produces.
+
+    THIS PINS A REAL BUG THAT THIS SHAPE EXPOSED. `forward`'s decode loop used to assign
+    `key = step.key(r)`, shadowing the `key` PARAMETER -- so the prefill branch below was handed a
+    request key (an int) where it expected the key tensor, and died on `key[start:end]`. Every batch
+    this port could form before chunked prefill worked was all-decode or all-prefill, so the bug was
+    invisible until a mixed batch existed. Both halves are checked here, because a fix that broke
+    either path would be worse than the bug: the decode row against the single-query reference, and
+    the prefill rows against attention over the whole store.
+    """
+    if not _need_cuda():
+        return
+    impl, layer, cache, md, q, per_req, csc = _world([40, 40], q_lens=[1, 5])
+    out = _run(impl, layer, cache, md, q)
+    lay = per_req[0]["lay"]
+    cos, sin = dc.cos_sin_from_cache(csc, torch.arange(40, device=DEV), D, max_position=39)
+
+    want_dec = attend_raw_store(lay, per_req[0]["ks"], per_req[0]["vs"], per_req[0]["dec"],
+                                q[0], cos, sin, D ** -0.5)
+    rel_dec = ((out[0] - want_dec).abs().max() / want_dec.abs().max()).item()
+
+    want_pre = _ref_prefill_multi(lay, per_req[1]["ks"], per_req[1]["vs"], per_req[1]["dec"],
+                                  q[1:].permute(1, 0, 2).contiguous(), cos, sin, D ** -0.5, p0=35)
+    rel_pre = ((out[1:] - want_pre).abs().max() / want_pre.abs().max()).item()
+
+    print(f"  mixed batch (1 decode + 5-query prefill): decode rel err {rel_dec:.3e}, "
+          f"prefill rel err {rel_pre:.3e}")
+    assert rel_dec < 1e-4, (
+        f"the DECODE half of a mixed batch disagrees with the reference by {rel_dec:.3e}; the "
+        f"prefill branch's presence must not disturb the decode path")
+    assert rel_pre < 1e-4, (
+        f"the PREFILL half of a mixed batch disagrees by {rel_pre:.3e}. A batch with both kinds of "
+        f"request goes through both branches in one `forward`, which is where the `key` shadowing "
+        f"lived -- an int reached `key[start:end]` and the engine died in EngineCore")
 
 
 def test_constructor_refuses_the_features_it_cannot_honour():

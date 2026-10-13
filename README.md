@@ -13,9 +13,11 @@ measurements — including the ones that went against us.
 **It works.** It serves `meta-llama/Llama-3.2-3B` through vLLM end to end on the stock scheduler,
 paged cache, and sampling path. Greedy output matches the uncompressed arm for the first 12 of 16
 tokens (the cache is lossy, so a divergence after a while is expected rather than a bug). The store is
-byte-exact against the reference container. 74 tests pass in the kernel environment and 93 in the
-vLLM environment (two files need a CUDA toolkit or the BDD runner and are run separately; a few
-model-dependent tests skip without a Hugging Face cache).
+byte-exact against the reference container. 98 tests pass in the kernel environment (two files skip
+without vLLM) and 118 in the vLLM environment; `tests/test_bdd.py` needs the BDD runner and
+`tests/test_kernel_krt.py` needs an NVRTC toolchain matching the driver — it passes in the kernel
+environment but not in the vLLM one, whose bundled NVRTC emits PTX this driver rejects
+(`cuModuleLoadData failed: 222 ... unsupported toolchain`).
 
 **Accuracy is the strong result.** RULER on Llama-3.2-3B, at 4k and 16k context, in fp16 and 4-bit
 storage. `safe` is the 4.53x allocation, `tight` the 6.42x one:
@@ -52,8 +54,17 @@ query that attends it. But the dots are identical to dense's, so even there we n
 arithmetic: the 27x penalty fades toward a rounding error, and what remains is the byte advantage
 (912 B a token a layer against 4096), which wins only if the kernel is read-bound. So **parity is
 reachable in the query-dense regime** where single-stream decode is 5.3x — and that is where the port
-is currently weakest, since the prefill path is still the torch `attend_prefill`. A fast multi-query
-score kernel is where the next effort pays, not the decode kernel.
+was weakest, since the prefill path is still the torch `attend_prefill`.
+
+**The first piece of that work is done, and it is the largest single speed result here.** The
+multi-query score kernel exists and is wired, so a chunked-prefill or prefix-cache continuation is
+served rather than refused and `enable_chunked_prefill` / `enable_prefix_caching` are available at all.
+The readout that goes with it is **114x cheaper per query** at Q=256 — one launch a chunk instead of
+one per token, and the GQA-group padding gone, which alone was 4x the arithmetic. Together they took
+the continuation's collapse at 4 and 8 concurrent 7.4k prompts from 225 s and 547 s to **58.6 s and
+188.7 s: 3.84x and 2.90x**. Decode is unchanged, and that is the point rather than a caveat — a
+continuation has `q_len` query tokens per stored row and an axis to amortise over; single-stream decode
+has exactly one, so every decode number above stands.
 
 **Capacity is not yet the win it should be.** The format is 4.53x, but vLLM sizes the cache from its
 peak-memory profiling pass and the fit's temporary buffers get charged against us permanently, so the
@@ -240,11 +251,16 @@ What remains is a short, ordered list, and none of it is plumbing:
    cache from the peak memory of its profiling pass and this impl's peak is high -- the fit's SVD
    workspace, per-request gathers, Triton workspace, `.contiguous()` copies. This is the difference
    between the ratio being true and the ratio being *useful*, and it is a footprint job.
-3. **Multi-query `krt`** -- the largest missing feature. `_prefill` REFUSES a continuation chunk
-   (seq_len > q_len) instead of silently attending over the chunk alone, so only single-chunk
-   prompts are servable today; that is why `enable_chunked_prefill=False` is correct for now. With
-   the kernel generalised to `q_len` queries over the same n stored rows, chunked prefill becomes
-   available -- and, per the earlier measurement, ratio-positive as well.
+3. **Multi-query `krt` — done, and the continuation is 3.84x faster than the version it replaced.**
+   A continuation chunk (`seq_len > q_len`) used to be REFUSED rather than silently attended over the
+   chunk alone. It is now served by `_prefill_continuation` over `krt_multi_from_slots` +
+   `v_out_multi_from_slots`: one reconstruction serves every query in a block, and the readout is one
+   launch a chunk instead of one per query, with the group padding gone. So
+   `enable_chunked_prefill` and `enable_prefix_caching` are both available -- `--chunked` and
+   `--prefix-cache` in the harness -- and the prefill collapse at N=4 and N=8 went from 225.3 s and
+   546.7 s to 58.6 s and 188.7 s (3.84x and 2.90x). What is left on this path is the *score*
+   reconstruction, still rebuilt once per query block, and the materialised
+   `[HQ, q_len, seq_len]` probabilities.
 4. **TTFT, which for a short generation is most of the wall clock -- and is the WORSE of the two
    ratios.** Measured by isolating it (`--new-tokens 1` makes the run's wall time the prompt's forward
    pass plus one step):
@@ -996,6 +1012,15 @@ fewer, larger rounds -- the write batched across layers is measured at 0.35 ms f
 problem, not a kernel-quality one, and it is the same finding from three directions now (the write
 path, the plan path, and the A/B that priced CUDA graphs at only +14%).
 
+**One correction since this was written, and it sharpens the claim rather than weakening it.** The
+read has now had the query-blocked change the write got in spirit — `v_out_multi_from_slots`, in "The
+continuation chunk" above — and it delivered 3.84x. That does not contradict this section, and the
+reason is the whole point: it helped on a CONTINUATION chunk, where there are `q_len` query tokens per
+stored row and an axis to amortise the decode over. Decode has exactly one query token per cached row,
+so there is no such axis and every number in the table above stands unchanged. What does not help is
+kernel QUALITY; what helps is finding an axis over which the per-layer work can be shared. Chunked
+prefill has one; single-stream decode does not.
+
 ### Decode against context, in the engine: the phase table was wrong
 
 `tests/bench_decode_vs_context.py` measures the one number the whole long-context question rests on,
@@ -1024,25 +1049,107 @@ prompt length either (ours ~3.5 s fixed plus ~0.48 us a token, stock's ~0.16), s
 cached token costs us `r1*d` multiply-adds per KV head to reconstruct the key, and costs dense `d` to
 read plus `G*d` to dot. The arithmetic ratio is therefore about `r1/(1+G)` — 110/4, ~27x for this
 model — and it does **not** improve with batch size, because at decode each request's cached rows are
-reached by exactly one query token per step. Amortisation needs many query tokens per cached row: a row
-is reconstructed ONCE and reused by every query that attends it, so the per-row cost becomes `r1*d/Q`
-against a dot that is `HQ*d` however many queries there are. The dots are identical to dense's, so **we
-never become cheaper than dense on arithmetic — the reconstruction simply fades from a 27x penalty to a
-rounding error.** What is left then is the byte advantage, which wins only if the kernel is read-bound
-rather than compute-bound. So:
+reached by exactly one query token per step.
+
+Amortisation needs many query tokens per cached row — a `Q` large enough that the reconstruction is
+shared by enough queries to matter. A row is reconstructed ONCE and reused by every query that attends
+it, so the per-row cost becomes `r1*d/Q` against a dot that is `HQ*d` however many queries there are.
+The dots are identical to dense's, so **we never become cheaper than dense on arithmetic — the
+reconstruction simply fades from a 27x penalty to a rounding error.** What is left at that point is the
+byte advantage (912 B a token a layer against 4096), which wins only if the kernel is read-bound rather
+than compute-bound. So the honest claim for the query-dense regime is *parity is reachable*, where
+single-stream decode is 5.3x. Whether parity becomes a win depends on the kernel, and that is the open
+question — not a settled advantage.
 
 * **single-stream decode is the regime this format is worst at**, and no kernel quality fixes it: even
   at 80% of fp32 peak the reconstruction is ~0.43 us a token a step, which at 16k is ~41 ms against
   stock's ~24, i.e. still ~1.7x slower. Today we are at ~5-10% of peak, so there is real ground to
   gain, but not to a win;
 * **query-dense work is where the penalty fades** — and it is where the port is currently weakest, since
-  `_prefill` is the torch `attend_prefill` and costs 4.5x stock. Parity is reachable there; a win is
-  not established, because the dots are the same as dense's and our advantage is bytes, not FLOPs. That,
-  not the decode kernel, is where the next engineering effort pays.
+  `_prefill` is the torch `attend_prefill` and costs 4.5x stock. Parity is reachable there; a win is not
+  established, because the dots are the same as dense's and our advantage is bytes, not FLOPs. That, not
+  the decode kernel, is where the next engineering effort pays.
 
 This is worth stating plainly because it changes the pitch: the honest claims are a 4.53x smaller cache
 and better accuracy per byte, with speed arriving in prefill and batched regimes rather than in
 single-stream decode.
+
+### The continuation chunk: the first query-dense work, and a 3.84x
+
+The section above ends by pointing at query-dense work as where the effort should go. This is the
+first piece of it, and it started from a collapse rather than a plan.
+
+**The cliff, and why it is not avoidable by configuration.** Running the concurrency sweep with
+long prompts (`--context 8192`, i.e. 7379-token prompts) at the shipped `max_num_batched_tokens`
+of 16384 produced this, on a configuration that is *not* the published decode table (chunked
+prefill and prefix caching are both on here, which is what the sweep wants):
+
+| N | prefill s | tokens | tok/s prefill | blocks / pool |
+| --- | --- | --- | --- | --- |
+| 1 | 7.53 | 7,379 | 980 | 462 / 7244 |
+| 2 | 13.79 | 14,758 | **1,070** | 924 / 7244 |
+| 4 | 225.26 | 29,516 | **131** | 1848 / 7244 |
+| 8 | 546.67 | 59,032 | **108** | 3696 / 7244 |
+
+N=1 and N=2 run at ~1,000 tokens/s and N>=4 at ~110, an 8-10x drop with no error anywhere. The
+cause is one number: `2 x 7379 = 14,758` fits the 16,384 budget and `4 x 7379 = 29,516` does not, so
+from N=4 the scheduler splits the prefill and every split schedules a CONTINUATION chunk — a request
+with rows already in the store and only some of its queries in the current batch.
+
+**Raising the budget is not available as an escape.** It costs activation memory that comes out of
+the same 16 GB: at 65536 and at 32768 the engine refuses to start with `No available memory for the
+cache blocks`, leaving nothing for the KV pool against `gpu_memory_utilization=0.90`. So 16384 is
+this card's ceiling, the continuation path is what long prompts on a small card actually run, and a
+4x-slower path there is a serving defect rather than an edge case.
+
+**The diagnosis.** The continuation itself was already correct — it reads the whole store through
+`krt_multi_from_slots` and agrees with attention over the whole store to 2.6e-07. Two things made it
+slow, and the second is a factor of the group size rather than a constant:
+
+1. **The readout was launched once per query token.** `v_out_from_slots` takes `[HQ, n]` weights and
+   returns `[HQ, d]`, so a chunk of `q_len` queries cost `q_len` launches — 5,753 of them a layer,
+   161k a step, at ~0.44 ms each.
+2. **Its contraction padded the GROUP axis to 16.** It contracts `[GP, KT] x [KT, HALF]`, so `GP` is
+   the only dimension that can clear `tl.dot`'s minimum of 16, and `G=4` therefore pads to 16 and
+   does **4x the arithmetic it needs**. `krt` never had this problem because its query block clears
+   the minimum on its own — the readout's shape simply did not have a query axis to put there.
+
+`v_out_multi_from_slots` fixes both at once by moving the query axis into `M`: one launch a chunk,
+and `M = BQ*GP` = 64 with `GP = next_power_of_2(G) = 4`, so the padding factor is 1.0 instead of 4.0.
+The tokens still reduce inside the program, because an output row is a sum over every stored token.
+
+| | before | after | |
+| --- | --- | --- | --- |
+| N=1 prefill s | 7.53 | 7.61 | unchanged — no continuation happens |
+| N=2 prefill s | 13.79 | 13.70 | unchanged — no continuation happens |
+| N=4 prefill s | 225.26 | **58.64** | **3.84x** |
+| N=8 prefill s | 546.67 | **188.74** | **2.90x** |
+
+Per prompt, the split run goes from 56.3 s (N=4) and 68.3 s (N=8) to 14.7 and 23.6, against 6.9 for
+the unsplit N=2 — so a continuation is 2.1x a first chunk at N=4 and 3.4x at N=8, where it was 8.2x
+and 9.9x. The whole four-point sweep also finished in 5m40s where the previous one was still running
+after 13 minutes.
+
+N=1 and N=2 being unchanged is the control: the change is confined to the continuation, so a
+speedup that also moved the first-chunk path would have been a different, suspicious result. In
+isolation, `tests/test_v_out_multi.py` prices the readout at **0.944 ms for Q=256 in one launch
+against 256 x 0.440 ms = 112.6 ms per-query, 114x**, and at Q=16, where a chunk tail still lands,
+17x.
+
+**Two things this does not fix, stated because they are the reason it is 3.84x and not 10x:**
+
+* the reconstructed K rows are still rebuilt **once per query block** inside `krt_multi_from_slots`,
+  because the query axis is a grid dimension there. The reconstruction is ~60% of that kernel's
+  arithmetic by count, so this is the next tiling change and it is a real one;
+* the `[HQ, q_len, seq_len]` score matrix is still materialised and then softmaxed into a second
+  tensor of the same size — ~0.9 GB each at these shapes, per layer, 50 GB of allocation traffic a
+  step. Fixing that means a tiled online softmax, which is a fusion rather than a tiling change.
+
+One measurement got worse in the process: `run_vllm_concurrency.py` derives decode rate as the
+difference between two generations, and with prefix caching on the second generation hits the cache,
+so the difference is a prefill and the rate comes out **negative** (-1.6, -1.5, -0.6 tok/s at
+N=1,2,4). The two flags are therefore decoupled — `--chunked` for chunked prefill, `--prefix-cache`
+for caching — so that the continuation can be exercised without destroying the decode number.
 
 ### The rank budget, measured as an accuracy cost
 
@@ -1174,18 +1281,31 @@ stand-in; real V compresses better. The direction holds, the magnitude does not.
    plugin-owned pool with handles threaded through `attn_metadata`, the way HPC threads its
    `hpc_*` fields. Sizing it needs `max_num_seqs × layers × r1_max × H × d` before the run.
 
-3. **Chunked prefill.** A later chunk must attend over earlier stored rows, which are raw, so it
-   needs the `krt` path over a prefix — not just the stock-SDPA prefill written here. Note also
-   that making the *build* depend on chunk boundaries makes the decoder depend on scheduler
-   decisions, so a preempted-and-recomputed request could get a different basis. Prefer a fold
-   schedule that is a function of the sequence, not of the scheduler's progress.
-3. **The fold schedule is scheduler-driven.** Paged serving mixes sequences of different ages in
+3. **Chunked prefill — the kernel exists now, and one half of the concern is still live.**
+   A later chunk must attend over earlier stored rows, which are raw, so it needs the `krt` path
+   over a prefix rather than the stock-SDPA prefill used for a first chunk. That path is written
+   (`_prefill_continuation`, over `krt_multi_from_slots` + `v_out_multi_from_slots`), agrees with
+   attention over the whole store to 2.6e-07, and is 3.84x faster than the per-query version it
+   replaced — see "The continuation chunk" below. Both `enable_chunked_prefill` and
+   `enable_prefix_caching` are reachable from the harness (`--chunked`, `--prefix-cache`).
+   What remains is the second half: making the *build* depend on chunk boundaries makes the decoder
+   depend on scheduler decisions, so a preempted-and-recomputed request could get a different
+   basis. The fit still lands on a request's first chunk, so a request recomputed with a different
+   first-chunk size refits. Prefer a fold schedule that is a function of the sequence, not of the
+   scheduler's progress.
+4. **The fold schedule is scheduler-driven.** Paged serving mixes sequences of different ages in
    one batch, so a global token counter does not work. `metadata.py` carries the tail length for
    this, but the policy is unresolved.
-4. **Streaming drift is unmeasured.** The decoder is frozen at prefill and never refit, so
+5. **The continuation's score matrix is materialised, and that is now the largest remaining cost.**
+   `_prefill_continuation` builds `[HQ, q_len, seq_len]` scores, then softmaxes them into a second
+   tensor of the same size. At the shapes a 16k budget actually produces that is ~0.9 GB a layer
+   per tensor, so ~1.8 GB of allocation traffic a layer and 50 GB a step. A tiled online-softmax
+   kernel that never materialises it is the next piece of work, and unlike the readout it is a
+   fusion rather than a tiling change.
+6. **Streaming drift is unmeasured.** The decoder is frozen at prefill and never refit, so
    quality should decay as generation moves away from the prefill span. Nothing in the
    measurements covers a long generation with many folds.
-5. **The `patch.py` interception is the fragile part.** For production, prefer the upstream
+7. **The `patch.py` interception is the fragile part.** For production, prefer the upstream
    shape: a model variant that constructs the store explicitly, as `hy_v3.py` does for HPC.
 
 ---

@@ -94,6 +94,19 @@ def main() -> int:
     ap.add_argument("--context", type=int, default=8192, help="target prompt tokens")
     ap.add_argument("--seqs", type=int, nargs="+", default=[1, 2, 4, 8, 12])
     ap.add_argument("--new-tokens", type=int, default=16)
+    ap.add_argument("--chunked", action="store_true",
+                    help="chunked prefill: splits a long prompt, which schedules continuation "
+                         "chunks, which the multi-query kernel now handles")
+    ap.add_argument("--prefix-cache", action="store_true",
+                    help="prefix caching. SEPARATE FROM --chunked because it breaks this script's "
+                         "decode measurement: with caching on, the second generation re-uses the "
+                         "first call's KV, so the two calls differ by a whole prefill and `tok/s "
+                         "decode` comes out negative")
+    ap.add_argument("--max-num-batched-tokens", type=int, default=16384,
+                    help="the token budget. This is what decides whether a batch splits at all: a "
+                         "prompt set that fits one chunk never enters the continuation path, which "
+                         "costs ~10x the first-chunk rate. Sweep both ways -- the fit tells you "
+                         "about the format, the split tells you about the continuation")
     ap.add_argument("--gap", type=int, default=8,
                     help="decode steps between the two generations. The decode rate is a difference of "
                          "two runs, so the gap has to be wide enough that its time is above timing "
@@ -107,7 +120,9 @@ def main() -> int:
     from vllm import SamplingParams
 
     t0 = time.time()
-    llm = _build(types.SimpleNamespace(arm=args.arm, graphs=args.graphs))
+    llm = _build(types.SimpleNamespace(arm=args.arm, graphs=args.graphs, chunked=args.chunked,
+                                       prefix_cache=args.prefix_cache,
+                                       max_num_batched_tokens=args.max_num_batched_tokens))
     load_s = time.time() - t0
     tok = llm.get_tokenizer()
     repeats = max(1, args.context // len(tok(PROMPT_UNIT)["input_ids"]))

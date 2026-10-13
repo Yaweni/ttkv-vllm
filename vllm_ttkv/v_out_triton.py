@@ -153,3 +153,142 @@ def v_out_from_slots(lay, v_slots, p, kt: int = 64):
         BM=D // 8, PB=pb, D=D, HALF=D // 2, G=G, GP=GP, KT=kt, V_BITS=lay.v_bits,
     )
     return out
+
+
+@triton.jit(do_not_specialize=["n", "Q"])
+def _v_out_multi_kernel(
+    u8, p_p, o_p, n, Q,
+    SLOT: tl.constexpr, ROW_OFF: tl.constexpr, ROW_STEP: tl.constexpr,
+    BM: tl.constexpr, PB: tl.constexpr, D: tl.constexpr, HALF: tl.constexpr,
+    H: tl.constexpr, HQ: tl.constexpr, G: tl.constexpr, GP: tl.constexpr,
+    KT: tl.constexpr, BQ: tl.constexpr, V_BITS: tl.constexpr,
+):
+    """`_v_out_kernel` with a QUERY BLOCK, so a decoded V tile serves `BQ` queries.
+
+    TWO THINGS THIS FIXES, and the second is the larger one.
+
+    1. THE LAUNCH COUNT. `v_out_from_slots` takes `[HQ, n]` weights and returns `[HQ, d]`, so a
+       chunk of `q_len` queries costs `q_len` launches -- 5753 of them per layer on the continuation
+       chunk that `--chunked` produces at four 7379-token prompts, i.e. 161k launches a step. Here
+       the query block is a grid axis and one launch covers all of them.
+
+    2. THE GROUP PADDING, which is a factor of `G` and not a constant. The single-query kernel
+       contracts `[GP, KT]` weights against `[KT, HALF]` values, so `MP` is the ONLY dimension that
+       can clear `tl.dot`'s minimum of 16 -- and `G` is 4 (Llama-3.x) or 8 (Qwen), so it pads to 16
+       and does FOUR TIMES the arithmetic it needs to. Moving the query axis into `M` removes the
+       padding entirely: `M = BQ*GP` is 64 with `GP = next_power_of_2(G) = 4`, which clears 16 on
+       its own. The dot count falls by exactly `2**ceil(log2(G))/G`.
+
+    The reduction over tokens stays INSIDE the program, as in the single-query kernel: an output row
+    is a sum over every stored token, so splitting tokens across programs would need one accumulation
+    per token block rather than a loop.
+    """
+    hv = tl.program_id(0)
+    jb = tl.program_id(1)
+    HALF_OFF: tl.constexpr = 1 << (V_BITS - 1)
+    lo = tl.arange(0, HALF)
+    hi = lo + HALF
+    gq = tl.arange(0, GP)
+    gm = gq < G
+    jj = jb * BQ + tl.arange(0, BQ)
+    jm = jj < Q
+    M: tl.constexpr = BQ * GP
+    acc_lo = tl.zeros((M, HALF), dtype=tl.float32)
+    acc_hi = tl.zeros((M, HALF), dtype=tl.float32)
+
+    for t0 in range(0, tl.cdiv(n, KT) * KT, KT):
+        it = t0 + tl.arange(0, KT)
+        tm = it < n
+        row = it * SLOT + ROW_OFF + hv * ROW_STEP
+
+        # ---- low half: which lanes are present, and where each one's code starts
+        bm = tl.load(u8 + row[:, None] + (lo // 8)[None, :], mask=tm[:, None], other=0).to(tl.int32)
+        is_lo = ((bm >> (7 - (lo % 8))[None, :]) & 1) != 0
+        rank_lo = tl.cumsum(is_lo.to(tl.int32), axis=1) - is_lo.to(tl.int32)
+        total_lo = tl.sum(is_lo.to(tl.int32), axis=1)
+        byte = (rank_lo * V_BITS) // 8
+        sh = (rank_lo * V_BITS) % 8
+        a0 = tl.load(u8 + row[:, None] + BM + byte, mask=tm[:, None], other=0).to(tl.int32)
+        a1 = tl.load(u8 + row[:, None] + BM + byte + 1,
+                     mask=tm[:, None] & (byte + 1 < PB), other=0).to(tl.int32)
+        code = (((a0 << 8) | a1) >> (16 - sh - V_BITS)) & ((1 << V_BITS) - 1)
+        rs = tl.load(u8 + row + BM + PB, mask=tm, other=0).to(tl.int16)
+        rs = (rs | (tl.load(u8 + row + BM + PB + 1, mask=tm, other=0).to(tl.int16) << 8)
+              ).to(tl.float16, bitcast=True).to(tl.float32)
+        v_lo = tl.where(is_lo, (code.to(tl.float32) - HALF_OFF) * rs[:, None], 0.0)
+
+        # ---- high half: ranks continue from the low half's total
+        bm2 = tl.load(u8 + row[:, None] + (hi // 8)[None, :], mask=tm[:, None], other=0).to(tl.int32)
+        is_hi = ((bm2 >> (7 - (hi % 8))[None, :]) & 1) != 0
+        rank_hi = total_lo[:, None] + tl.cumsum(is_hi.to(tl.int32), axis=1) - is_hi.to(tl.int32)
+        byte2 = (rank_hi * V_BITS) // 8
+        sh2 = (rank_hi * V_BITS) % 8
+        b0 = tl.load(u8 + row[:, None] + BM + byte2, mask=tm[:, None], other=0).to(tl.int32)
+        b1 = tl.load(u8 + row[:, None] + BM + byte2 + 1,
+                     mask=tm[:, None] & (byte2 + 1 < PB), other=0).to(tl.int32)
+        code2 = (((b0 << 8) | b1) >> (16 - sh2 - V_BITS)) & ((1 << V_BITS) - 1)
+        v_hi = tl.where(is_hi, (code2.to(tl.float32) - HALF_OFF) * rs[:, None], 0.0)
+
+        # ---- weights `[BQ, GP, KT]`, query-major so the `[M, KT]` reshape puts (query, group) on
+        #      the row axis the same way the store below unpacks it. Out-of-range queries read
+        #      masked-to-zero, and a zero weight contributes a zero row -- the same reason the
+        #      single-query kernel's padded GROUP rows are zero rather than a real row of `p`.
+        woff = ((hv * G + gq)[None, :, None] * Q + jj[:, None, None]) * n + it[None, None, :]
+        pg = tl.reshape(
+            tl.load(p_p + woff, mask=jm[:, None, None] & gm[None, :, None] & tm[None, None, :],
+                    other=0.0).to(tl.float32), (M, KT))
+        acc_lo = tl.dot(pg, v_lo, acc_lo, input_precision="ieee")
+        acc_hi = tl.dot(pg, v_hi, acc_hi, input_precision="ieee")
+
+    ooff = ((hv * G + gq)[None, :, None] * Q + jj[:, None, None]) * D
+    om = jm[:, None, None] & gm[None, :, None]
+    tl.store(o_p + ooff + lo[None, None, :], tl.reshape(acc_lo, (BQ, GP, HALF)), mask=om)
+    tl.store(o_p + ooff + hi[None, None, :], tl.reshape(acc_hi, (BQ, GP, HALF)), mask=om)
+
+
+def v_out_multi_from_slots(lay, v_slots, p, kt: int = 32, bq: int = 16):
+    """Attention output `[HQ, Q, d]` fp32 for a BLOCK of `Q` query tokens, in ONE launch.
+
+    p: `[HQ, Q, n]` fp32, already softmaxed and scaled -- this kernel applies no scale, matching the
+    single-query kernel. Masked (causal) positions must already be ZERO in `p`, which is what
+    softmaxing a `-inf` score produces; there is no causal argument here because this kernel has no
+    scores.
+
+    Not a variant of `v_out_from_slots` for convenience: it does less arithmetic (see the kernel's
+    docstring) and it is the path `_prefill_continuation` uses. The single-query kernel stays because
+    a decode step has exactly one query token per request.
+    """
+    if p.dim() != 3:
+        raise ValueError(
+            f"the multi-query readout takes p as [HQ, Q, n]; got {tuple(p.shape)}. The single-query "
+            f"form is `v_out_from_slots`.")
+    n, H, D = v_slots.shape[0], lay.H, lay.d
+    HQ, Q = p.shape[0], p.shape[1]
+    if p.shape[2] != n:
+        raise ValueError(f"weights are [HQ, {p.shape[1]}, {p.shape[2]}] but the store holds "
+                         f"n={n} rows")
+    if HQ % H:
+        raise ValueError(f"HQ={HQ} is not a multiple of H={H}")
+    if D % 32:
+        raise ValueError(f"d={D} must be a multiple of 32 for this two-half lane split")
+    G = HQ // H
+    GP = triton.next_power_of_2(G)
+    if kt & (kt - 1) or kt < 16:
+        raise ValueError("kt must be a power of two >= 16")
+    if bq < 1 or (bq & (bq - 1)) or (bq * GP) < _DOT_M:
+        raise ValueError(
+            f"bq={bq} with GP={GP} gives {bq * GP} rows in the contraction, and tl.dot needs a "
+            f"power of two >= {_DOT_M}: bq must be a power of two with bq*GP >= {_DOT_M}")
+
+    pb = packed_row_bytes(lay.v_lanes, lay.v_bits)
+    out = torch.empty(HQ, Q, D, device=v_slots.device, dtype=torch.float32)
+    # `num_stages=1` for the same reason as the multi-query `krt`: the loop holds two `[KT, HALF]`
+    # value tiles live at once, and Triton's default pipelining multiplies every `tl.load` buffer by
+    # the stage count against the same 101 KB of shared memory that kernel already exhausted.
+    _v_out_multi_kernel[(H, triton.cdiv(Q, bq))](
+        v_slots, p.contiguous(), out, n, Q,
+        SLOT=lay.v_slot_bytes, ROW_OFF=0, ROW_STEP=D // 8 + pb + 2,
+        BM=D // 8, PB=pb, D=D, HALF=D // 2, H=H, HQ=HQ, G=G, GP=GP, KT=kt, BQ=bq,
+        V_BITS=lay.v_bits, num_stages=1,
+    )
+    return out
