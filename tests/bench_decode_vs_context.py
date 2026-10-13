@@ -45,14 +45,22 @@ GAP = 16
 # The layer-calls and the steps the engine reports, so the ms/step below can be checked against the
 # phase table instead of trusted: 28 layers per step means one step is 28 layer-calls.
 def _measure(llm, prompt, gap: int) -> tuple[float, float, float]:
-    """(prefill_s, ms_per_step, steps_measured) for one context."""
+    """(prefill_s, ms_per_step, steps_measured) for one context.
+
+    `ignore_eos=True` on both calls, and it is what makes the marginal mean anything. The second call
+    asks for `1 + gap` tokens, but the prompt is repeated prose and greedy decoding can stop on EOS
+    after one -- in which case the two calls cost the SAME, the difference is ~0, and `ms_per_step`
+    comes out near zero instead of near 40. Forcing the full count also makes `steps_measured` true
+    rather than assumed. `tests/bench_vllm_baseline.py` already did this; this instrument did not, and
+    it is the one the decode table is built from.
+    """
     from vllm import SamplingParams
 
     t0 = time.time()
-    llm.generate([prompt], SamplingParams(temperature=0.0, max_tokens=1))
+    llm.generate([prompt], SamplingParams(temperature=0.0, max_tokens=1, ignore_eos=True))
     one_s = time.time() - t0
     t0 = time.time()
-    llm.generate([prompt], SamplingParams(temperature=0.0, max_tokens=1 + gap))
+    llm.generate([prompt], SamplingParams(temperature=0.0, max_tokens=1 + gap, ignore_eos=True))
     long_s = time.time() - t0
     per_step = (long_s - one_s) / gap * 1e3
     return one_s - per_step / 1e3, per_step, gap

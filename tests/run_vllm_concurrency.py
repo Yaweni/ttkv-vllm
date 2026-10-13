@@ -60,32 +60,47 @@ def _prompt(i: int, n: int, repeats: int) -> str:
     Two traps this avoids, both learned from a crash. Identical prompts would let vLLM serve N
     requests off one cached prefix, so the block demand would collapse and the sweep would measure the
     prefix cache instead of the pool. And reusing a prompt across sweep points is worse: the engine
-    recognises it, schedules only the new tokens as a continuation chunk, and a chunked prefill is
-    something this impl REFUSES by design (the prefill branch needs a multi-query `krt`). That refusal
-    is correct behaviour and it looks exactly like a concurrency bug.
+    recognises it, schedules only the new tokens as a continuation chunk, and at the time this was
+    written a chunked prefill was something this impl REFUSED -- correctly, because the prefill branch
+    needed a multi-query `krt` that did not exist. That refusal looked exactly like a concurrency bug.
+    The kernel exists now and a continuation is served, so reusing a prompt would no longer fail; it
+    would silently turn a sweep point into continuation measurements instead of first-chunk ones,
+    which is quieter and worse. Keep the prompts distinct.
     """
     return f"Note {i} of {n}: the following passage is repeated for length. " + PROMPT_UNIT * repeats
 
 
 def _sweep_one(llm, prompts, short: int, long: int):
-    """(prefill s, decode s, decode tokens) for one batch, as a MARGINAL over generation length.
+    """(prefill s, decode s, DECODE TOKENS OBSERVED) for one batch, as a MARGINAL over generation
+    length.
 
     Two generations of the same prompts, `short` tokens and `long` tokens, and the difference between
     their times is the cost of `long - short` decode steps -- the prefill cancels. That matters here
     because this port's prefill is 26x stock's, so any rate that includes it is a measurement of
-    prefill wearing a decode label. It also avoids needing the prefix cache to make a second call
-    cheap, which is just as well: prefix caching is off on this arm by design.
+    prefill wearing a decode label.
+
+    `ignore_eos=True` IS NOT A DETAIL, and without it this function reports nonsense rather than
+    failing. The prompts are repeated prose, so greedy decoding can emit EOS early -- in BOTH calls --
+    and then the two generations cost the same and the marginal is ~0, which divides into a rate of
+    hundreds of tokens a second or a negative one. Forcing exactly `max_tokens` also makes the token
+    count KNOWN rather than hoped for.
+
+    The counts are RETURNED rather than recomputed from the arguments, so a short generation shows up
+    as a small denominator instead of as a plausible wrong number. The caller prints what it got.
     """
     from vllm import SamplingParams
 
     t0 = time.time()
-    llm.generate(prompts, SamplingParams(temperature=0.0, max_tokens=short))
+    first = llm.generate(prompts,
+                         SamplingParams(temperature=0.0, max_tokens=short, ignore_eos=True))
     first_s = time.time() - t0
     t0 = time.time()
-    llm.generate(prompts, SamplingParams(temperature=0.0, max_tokens=long))
+    second = llm.generate(prompts,
+                          SamplingParams(temperature=0.0, max_tokens=long, ignore_eos=True))
     second_s = time.time() - t0
-    n = len(prompts)
-    return first_s, second_s - first_s, n * (long - short)
+    got = (sum(len(o.outputs[0].token_ids) for o in second)
+           - sum(len(o.outputs[0].token_ids) for o in first))
+    return first_s, second_s - first_s, got
 
 
 def main() -> int:
@@ -107,11 +122,16 @@ def main() -> int:
                          "prompt set that fits one chunk never enters the continuation path, which "
                          "costs ~10x the first-chunk rate. Sweep both ways -- the fit tells you "
                          "about the format, the split tells you about the continuation")
-    ap.add_argument("--gap", type=int, default=8,
+    ap.add_argument("--gap", type=int, default=64,
                     help="decode steps between the two generations. The decode rate is a difference of "
-                         "two runs, so the gap has to be wide enough that its time is above timing "
-                         "noise -- 8 steps is fine for this port's ~79 ms/step, but the stock arm with "
-                         "CUDA graphs runs fast enough that 8 steps is inside the noise, so widen it")
+                         "two runs, so the gap has to be wide enough that its time clears the "
+                         "run-to-run variance of the PREFILL that is supposed to cancel -- and that "
+                         "variance is what makes a small gap useless here. This port's prefill is "
+                         "seconds (7.6 s for one 7379-token prompt) against ~40-125 ms a decode step, "
+                         "so a gap of 8 is ~0.3 s inside a ~0.3 s noise band, which is why the decode "
+                         "column read -1.6 and -533.9 tok/s. 64 steps is ~2.6-8 s, comfortably above "
+                         "it. The stock arm with CUDA graphs is fast enough that a small gap is inside "
+                         "the noise there too, so widening it costs nothing")
     ap.add_argument("--graphs", action="store_true",
                     help="baseline only: CUDA graphs + torch.compile, to price the integration cost")
     ap.add_argument("--out")
@@ -141,12 +161,20 @@ def main() -> int:
         prompts = [_prompt(i, n, repeats) for i in range(n)]
         prefill_s, decode_s, got = _sweep_one(llm, prompts, short, long)
         need = n * (-(-probe // BLOCK))
-        rate = got / decode_s if decode_s else 0.0
-        print(f"  {n:3d} {prefill_s:10.2f} {decode_s:9.2f} {got:8d} {rate:13.1f}"
+        # A non-positive marginal means the two generations cost the same, which is a broken
+        # measurement rather than a slow or fast one -- the bucket this column sat in for a while.
+        # Print it, do not launder it into a rate.
+        if decode_s > 0:
+            rate, rate_s = got / decode_s, None
+        else:
+            rate, rate_s = None, f"{'n/a':>13s}"
+        print(f"  {n:3d} {prefill_s:10.2f} {decode_s:9.2f} {got:8d}"
+              f" {rate_s or f'{rate:13.1f}'}"
               f" {need:8d} {str(n_blocks):>6s}"
               f"   {'fits' if n_blocks and need <= n_blocks else 'OVER POOL'}", flush=True)
         recs.append({"n": n, "prefill_s": round(prefill_s, 2), "decode_s": round(decode_s, 2),
-                     "out_tokens": got, "tok_per_s_decode": round(rate, 2),
+                     "out_tokens": got,
+                     "tok_per_s_decode": None if rate is None else round(rate, 2),
                      "blocks_needed": need, "blocks_pool": n_blocks})
     if args.out:
         pathlib.Path(args.out).write_text(json.dumps(

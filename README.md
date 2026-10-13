@@ -66,6 +66,18 @@ the continuation's collapse at 4 and 8 concurrent 7.4k prompts from 225 s and 54
 continuation has `q_len` query tokens per stored row and an axis to amortise over; single-stream decode
 has exactly one, so every decode number above stands.
 
+**But the capacity does not convert into throughput, and that is the hardest number here.** At batch 8
+we serve **47 tokens a second where stock serves 324** — and the gap WIDENS with batch, 2.0x at batch 1
+and 6.9x at batch 8. Our throughput plateaus: batching buys 1.8x and then stops, against stock's 6.4x
+over the same range. The reason is structural — the per-step work is issued per REQUEST, 28 read
+layer-calls and 28 write layer-calls for each request in the batch, each carrying host readbacks that
+drain the pipeline, where dense attention merges the batch into one kernel per layer. So the argument
+that a smaller cache buys more concurrency and more concurrency buys more speed does **not** hold on
+this port as it stands, and saying so is the point of this README rather than a footnote to it.
+Getting that number took two instrument fixes (forcing generation length; widening the step gap past
+the run-to-run variance of our own much longer prefill), both recorded in the measurements section,
+because the first two answers the instrument gave were wrong in our favour.
+
 **Capacity is not yet the win it should be.** The format is 4.53x, but vLLM sizes the cache from its
 peak-memory profiling pass and the fit's temporary buffers get charged against us permanently, so the
 realised capacity is 1.74x against stock — behind in-tree fp8 (8.77x). Fixing that accounting is the
@@ -1145,11 +1157,65 @@ against 256 x 0.440 ms = 112.6 ms per-query, 114x**, and at Q=16, where a chunk 
   tensor of the same size — ~0.9 GB each at these shapes, per layer, 50 GB of allocation traffic a
   step. Fixing that means a tiled online softmax, which is a fusion rather than a tiling change.
 
-One measurement got worse in the process: `run_vllm_concurrency.py` derives decode rate as the
-difference between two generations, and with prefix caching on the second generation hits the cache,
-so the difference is a prefill and the rate comes out **negative** (-1.6, -1.5, -0.6 tok/s at
-N=1,2,4). The two flags are therefore decoupled — `--chunked` for chunked prefill, `--prefix-cache`
-for caching — so that the continuation can be exercised without destroying the decode number.
+One measurement got worse in the process, and the fix took two more steps than expected: the
+concurrency sweep's decode rate is a DIFFERENCE between two generations, and it came out negative
+(-1.6, -1.5, -0.6 tok/s at N=1,2,4) with prefix caching on. Decoupling the flags (`--chunked` for
+chunked prefill, `--prefix-cache` for caching) was necessary but not sufficient — the difference was
+still unusable, for two further reasons, and both are written up in "Decode against concurrency"
+below, which is where the honest answer to the throughput question now lives.
+
+### Decode against concurrency: capacity does not convert to throughput
+
+This is the measurement the whole project is aimed at — a 4.53x smaller cache is only worth anything
+if it buys more concurrent requests, and more concurrent requests are only worth anything if they
+produce more tokens a second. The answer is **no, not as implemented**, and it took three attempts to
+get an instrument that could say so.
+
+**Why the first two answers were wrong.** `run_vllm_concurrency.py` derives the decode rate as a
+difference of two generations of the same prompts, so the prefill cancels. That is sound in principle
+and it is exactly what the published decode table uses. It failed here for reasons that are specific
+to this port:
+
+1. **Generation length was not forced.** Neither call passed `ignore_eos`, so on repeated prose greedy
+   decoding can stop on EOS in BOTH calls, the two cost the same, and the difference is ~0 — which
+   divides into a rate of hundreds of tokens a second, or a negative one. This reads as a fast result
+   rather than as a broken one, which is why it survived a whole sweep. `tests/bench_vllm_baseline.py`
+   had this flag; this harness and `bench_decode_vs_context.py` did not.
+2. **The marginal was smaller than the prefill's own variance.** This port's prefill is SECONDS (5-36 s
+   here) where stock's is 0.6-2 s, and the decode marginal for a short gap is ~2 s. So the instrument
+   was measuring the run-to-run wobble of a 36-second prefill. The tell was an N=2 result implying
+   **4.5 ms per decode step**, against a step the table above prices at ~34-39 ms. Widening the gap to
+   256 steps makes the marginal tens of seconds and the wobble irrelevant.
+
+Both fixes are in, and the control that proves the instrument now works is that stock scales on it
+monotonically while ours does not. Context 2048, so nothing splits and no continuation is involved;
+`gap=256`, 16 + 256 tokens a request; A4000, batch 1 to 8:
+
+| N | ours decode s | ours tok/s | ours ms/step | stock decode s | stock tok/s | ratio |
+| --- | --- | --- | --- | --- | --- | --- |
+| 1 | 9.87 | 25.9 | 38.6 | 5.03 | 50.9 | 2.0x |
+| 2 | 12.66 | 40.4 | 49.5 | 5.33 | 96.1 | 2.4x |
+| 4 | 22.10 | 46.3 | 86.3 | 5.66 | 181.0 | 3.9x |
+| 8 | 43.41 | 47.2 | 169.6 | 6.32 | 324.2 | **6.9x** |
+
+**Ours flattens at ~47 tokens a second; stock reaches 324.** Batching buys us 1.8x (25.9 to 47.2) and
+then stops, while stock gets 6.4x from the same range. And the ratio degrades rather than holding,
+2.0x at batch 1 to 6.9x at batch 8, so concurrency makes the comparison *worse* for us, not better.
+
+**The reason is structural, and it is the same one the write path already showed.** Our step time grows
+essentially linearly in batch size from B=2 on — 49.5 -> 86.3 -> 169.6 ms — which means the work is
+being issued PER REQUEST and does not merge across requests. It is 28 layer-calls of read and 28 of
+write for each request in the batch (`_decode_one` and `_write_store` both loop over requests), each
+carrying host readbacks that drain the pipeline, so 8 requests cost 8 times the per-request work plus
+a fixed per-step term. Dense attention merges the batch into one kernel per layer; this does not, so
+batching cannot be the lever that pays for the format's arithmetic.
+
+**What that means for the pitch, stated plainly.** The capacity numbers are real — 4.53x smaller, and
+1.74x realised against stock today. But the argument that more concurrency converts that into
+throughput does **not** hold on this port as it stands: at batch 8 we serve 47 tokens a second where
+stock serves 324, and adding concurrency does not close it. Closing it needs the per-request work to
+become per-step work — one gather, one reconstruction, one readout for the whole batch, which is the
+same "fewer, larger rounds" finding as the write path and the plan path, for the fourth time.
 
 ### The rank budget, measured as an accuracy cost
 
