@@ -47,10 +47,13 @@ fixed overhead, is what long context becomes. Prefill is ~26x slower at 1082 tok
 `r1*d` multiply-adds per cached row per step where a dense read costs `d`, so the arithmetic ratio is
 about `r1/(1+G)` = 110/4 ~ 27x — and it does **not** amortise with batch size, because each request's
 rows are reached by exactly one query token per step. It amortises only with many query tokens per
-cached row: prefill and chunked prefill, where the ratio becomes `r1/((1+G)*Q)` and at Q=2048 is a 75x
-advantage. So single-stream decode is the regime this format is worst at, and query-dense work is where
-it wins — which is also where the port is currently weakest, since the prefill path is still the torch
-`attend_prefill`. A fast prefill kernel is where the next effort pays, not the decode kernel.
+cached row — prefill and chunked prefill — because a row is reconstructed once and reused by every
+query that attends it. But the dots are identical to dense's, so even there we never become cheaper on
+arithmetic: the 27x penalty fades toward a rounding error, and what remains is the byte advantage
+(912 B a token a layer against 4096), which wins only if the kernel is read-bound. So **parity is
+reachable in the query-dense regime** where single-stream decode is 5.3x — and that is where the port
+is currently weakest, since the prefill path is still the torch `attend_prefill`. A fast multi-query
+score kernel is where the next effort pays, not the decode kernel.
 
 **Capacity is not yet the win it should be.** The format is 4.53x, but vLLM sizes the cache from its
 peak-memory profiling pass and the fit's temporary buffers get charged against us permanently, so the
