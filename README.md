@@ -1024,17 +1024,21 @@ prompt length either (ours ~3.5 s fixed plus ~0.48 us a token, stock's ~0.16), s
 cached token costs us `r1*d` multiply-adds per KV head to reconstruct the key, and costs dense `d` to
 read plus `G*d` to dot. The arithmetic ratio is therefore about `r1/(1+G)` — 110/4, ~27x for this
 model — and it does **not** improve with batch size, because at decode each request's cached rows are
-reached by exactly one query token per step. Amortisation needs many query tokens per cached row, i.e.
-a `Q` greater than `r1/(1+G)`: prefill, and chunked prefill. There the ratio becomes `r1/((1+G)*Q)`,
-which at Q=2048 is a 75x *advantage*. So:
+reached by exactly one query token per step. Amortisation needs many query tokens per cached row: a row
+is reconstructed ONCE and reused by every query that attends it, so the per-row cost becomes `r1*d/Q`
+against a dot that is `HQ*d` however many queries there are. The dots are identical to dense's, so **we
+never become cheaper than dense on arithmetic — the reconstruction simply fades from a 27x penalty to a
+rounding error.** What is left then is the byte advantage, which wins only if the kernel is read-bound
+rather than compute-bound. So:
 
 * **single-stream decode is the regime this format is worst at**, and no kernel quality fixes it: even
   at 80% of fp32 peak the reconstruction is ~0.43 us a token a step, which at 16k is ~41 ms against
   stock's ~24, i.e. still ~1.7x slower. Today we are at ~5-10% of peak, so there is real ground to
   gain, but not to a win;
-* **query-dense work is the regime it wins at**, and that is also where the port is currently weakest —
-  `_prefill` is the torch `attend_prefill` and costs 4.5x stock. That, not the decode kernel, is where
-  the next engineering effort pays.
+* **query-dense work is where the penalty fades** — and it is where the port is currently weakest, since
+  `_prefill` is the torch `attend_prefill` and costs 4.5x stock. Parity is reachable there; a win is
+  not established, because the dots are the same as dense's and our advantage is bytes, not FLOPs. That,
+  not the decode kernel, is where the next engineering effort pays.
 
 This is worth stating plainly because it changes the pitch: the honest claims are a 4.53x smaller cache
 and better accuracy per byte, with speed arriving in prefill and batched regimes rather than in
