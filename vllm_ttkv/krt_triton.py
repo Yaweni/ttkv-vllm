@@ -151,6 +151,173 @@ def _krt_kernel(
     tl.store(s_p + (hv * G + gq)[:, None] * n + it[None, :], sc, mask=tm[None, :])
 
 
+@triton.jit(do_not_specialize=["n", "r1", "Q", "P0"])
+def _krt_multi_kernel(
+    u8, i8, dec, cos_p, sin_p, q_p, s_p, n, r1, Q, P0,
+    SLOT: tl.constexpr, ROW_OFF: tl.constexpr, ROW_STEP: tl.constexpr, CSCALE_OFF: tl.constexpr,
+    PB: tl.constexpr, D: tl.constexpr, HALF: tl.constexpr, BM: tl.constexpr,
+    H: tl.constexpr, HQ: tl.constexpr, G: tl.constexpr, GP: tl.constexpr,
+    KT: tl.constexpr, BR: tl.constexpr, BQ: tl.constexpr,
+    RES_BITS: tl.constexpr, HAS_RES: tl.constexpr, CAUSAL: tl.constexpr,
+):
+    """`_krt_kernel` with a QUERY BLOCK, so one reconstruction serves `BQ` queries.
+
+    WHAT CHANGES AND WHY IT IS THE WHOLE POINT. Steps 1-3 (reconstruct, patch, rotate) depend on the
+    stored row and NOT on the query. The single-query kernel therefore pays `r1*d` per row for a
+    single query, which is what makes the read 27x dense's arithmetic. Here the grid carries a third
+    axis over queries, so a row block is reconstructed once per (row block, head, query block) and
+    reused for all `BQ` queries in it. With `BQ*GP` comfortably above `r1`, the reconstruction stops
+    dominating -- it falls to roughly `r1/(BQ*G)` of the contraction.
+
+    It does not vanish: a larger query block means more reuse, and the grid's query axis means the
+    reconstruction is paid once per block rather than once per query. That is the standard attention
+    tiling trade, made here in favour of the reconstruction because the reconstruction is the
+    expensive part on this path.
+    """
+    pid = tl.program_id(0)
+    hv = tl.program_id(1)
+    jb = tl.program_id(2)
+    DSTR: tl.constexpr = H * D
+    HALF_OFF: tl.constexpr = 1 << (RES_BITS - 1)
+    it = pid * KT + tl.arange(0, KT)
+    tm = it < n
+    row = it * SLOT + ROW_OFF + hv * ROW_STEP
+    lo = tl.arange(0, HALF)
+    hi = lo + HALF
+
+    # ---- 1. reconstruct, identical to the single-query kernel: two halves throughout, so the
+    #         rotation needs no register shuffle.
+    cq_s = tl.load(u8 + it * SLOT + CSCALE_OFF).to(tl.int16)
+    cq_s = (cq_s | (tl.load(u8 + it * SLOT + CSCALE_OFF + 1).to(tl.int16) << 8)
+            ).to(tl.float16, bitcast=True).to(tl.float32)
+    acc_lo = tl.zeros((KT, HALF), dtype=tl.float32)
+    acc_hi = tl.zeros((KT, HALF), dtype=tl.float32)
+    for r0 in range(0, r1, BR):
+        ar = r0 + tl.arange(0, BR)
+        rm = ar < r1
+        g = tl.load(i8 + it[:, None] * SLOT + ar[None, :],
+                    mask=tm[:, None] & rm[None, :], other=0).to(tl.float32) * cq_s[:, None]
+        acc_lo = tl.dot(g, tl.load(dec + ar[:, None] * DSTR + (hv * D + lo)[None, :],
+                                   mask=rm[:, None], other=0.0), acc_lo, input_precision="ieee")
+        acc_hi = tl.dot(g, tl.load(dec + ar[:, None] * DSTR + (hv * D + hi)[None, :],
+                                   mask=rm[:, None], other=0.0), acc_hi, input_precision="ieee")
+
+    # ---- 2. patch the lanes the fit missed. A high-half lane's rank carries the low half's total.
+    if HAS_RES:
+        bm_lo = tl.load(u8 + row[:, None] + (lo // 8)[None, :],
+                        mask=tm[:, None], other=0).to(tl.int32)
+        is_lo = ((bm_lo >> (7 - (lo % 8))[None, :]) & 1) != 0
+        rank_lo = tl.cumsum(is_lo.to(tl.int32), axis=1) - is_lo.to(tl.int32)
+        total_lo = tl.sum(is_lo.to(tl.int32), axis=1)
+        byte = (rank_lo * RES_BITS) // 8
+        sh = (rank_lo * RES_BITS) % 8
+        p0 = tl.load(u8 + row[:, None] + BM + byte, mask=tm[:, None], other=0).to(tl.int32)
+        p1 = tl.load(u8 + row[:, None] + BM + byte + 1,
+                     mask=tm[:, None] & (byte + 1 < PB), other=0).to(tl.int32)
+        code = (((p0 << 8) | p1) >> (16 - sh - RES_BITS)) & ((1 << RES_BITS) - 1)
+        rs = tl.load(u8 + row + BM + PB, mask=tm, other=0).to(tl.int16)
+        rs = (rs | (tl.load(u8 + row + BM + PB + 1, mask=tm, other=0).to(tl.int16) << 8)
+              ).to(tl.float16, bitcast=True).to(tl.float32)
+        acc_lo += tl.where(is_lo, (code.to(tl.float32) - HALF_OFF) * rs[:, None], 0.0)
+
+        bm_hi = tl.load(u8 + row[:, None] + (hi // 8)[None, :],
+                        mask=tm[:, None], other=0).to(tl.int32)
+        is_hi = ((bm_hi >> (7 - (hi % 8))[None, :]) & 1) != 0
+        rank_hi = total_lo[:, None] + tl.cumsum(is_hi.to(tl.int32), axis=1) - is_hi.to(tl.int32)
+        byte2 = (rank_hi * RES_BITS) // 8
+        sh2 = (rank_hi * RES_BITS) % 8
+        q0 = tl.load(u8 + row[:, None] + BM + byte2, mask=tm[:, None], other=0).to(tl.int32)
+        q1 = tl.load(u8 + row[:, None] + BM + byte2 + 1,
+                     mask=tm[:, None] & (byte2 + 1 < PB), other=0).to(tl.int32)
+        code2 = (((q0 << 8) | q1) >> (16 - sh2 - RES_BITS)) & ((1 << RES_BITS) - 1)
+        acc_hi += tl.where(is_hi, (code2.to(tl.float32) - HALF_OFF) * rs[:, None], 0.0)
+
+    # ---- 3. rotate each row by ITS OWN position, `(j, j + D/2)` pairing.
+    y_lo = (acc_lo * tl.load(cos_p + it[:, None] * D + lo[None, :], mask=tm[:, None], other=0.0)
+            - acc_hi * tl.load(sin_p + it[:, None] * D + lo[None, :], mask=tm[:, None],
+                               other=0.0))
+    y_hi = (acc_hi * tl.load(cos_p + it[:, None] * D + hi[None, :], mask=tm[:, None], other=0.0)
+            + acc_lo * tl.load(sin_p + it[:, None] * D + hi[None, :], mask=tm[:, None],
+                               other=0.0))
+
+    # ---- 4. contract the SAME reconstructed rows against a block of queries. `GP` pads the group
+    #         axis to a power of two so `BQ*GP` clears `tl.dot`'s minimum of 16 without allocating a
+    #         padded query: the padding rows are MASKED to zero, and a zero query scores zero.
+    jj = jb * BQ + tl.arange(0, BQ)
+    jm = jj < Q
+    gq = tl.arange(0, GP)
+    qm = gq < G
+    qoff = ((hv * G + gq)[None, :, None] * Q + jj[:, None, None]) * D + lo[None, None, :]
+    qlm = jm[:, None, None] & qm[None, :, None]
+    q_lo = tl.load(q_p + qoff, mask=qlm, other=0.0).to(tl.float32)
+    q_hi = tl.load(q_p + qoff + HALF, mask=qlm, other=0.0).to(tl.float32)
+    sc = tl.dot(tl.reshape(q_lo, (BQ * GP, HALF)), tl.trans(y_lo), input_precision="ieee")
+    sc = tl.dot(tl.reshape(q_hi, (BQ * GP, HALF)), tl.trans(y_hi), sc, input_precision="ieee")
+
+    if CAUSAL:
+        # Query `j` sits at `P0 + j` and may attend to rows `0 .. P0 + j`. `-inf` rather than zero:
+        # zero is a legitimate score, and the caller's softmax would treat it as a real one.
+        pos = P0 + jj
+        allow = tl.broadcast_to((it[None, :] <= pos[:, None])[:, None, :], (BQ, GP, KT))
+        sc = tl.where(tl.reshape(allow, (BQ * GP, KT)), sc, float("-inf"))
+
+    soff = ((hv * G + gq)[None, :, None] * Q + jj[:, None, None]) * n + it[None, None, :]
+    tl.store(s_p + soff, tl.reshape(sc, (BQ, GP, KT)),
+             mask=qlm & tm[None, None, :])
+
+
+def krt_multi_from_slots(lay, slots, decoder_f, cos, sin, q, kt: int = 32, br: int = 32,
+                         bq: int = 16, p0: int | None = None):
+    """Multi-query `krt`: scores `[HQ, Q, n]` fp32 for `Q` query tokens, from the same store.
+
+    `q` is `[HQ, Q, d]` POST-rotary, the frame `_prefill` already holds. `p0` is the absolute position
+    of query 0 and turns on causal masking; leave it None for a fully-connected block (which is what
+    a decode-shaped call with Q=1 wants, and it then agrees with `krt_from_slots`).
+
+    `bq` is the QUERY BLOCK and it is the knob that matters: the reconstruction is paid once per
+    (row block, head, query block), so `bq` sets how much of it is amortised. `bq*GP` must clear
+    `tl.dot`'s minimum of 16.
+    """
+    n, H, D = slots.shape[0], lay.H, lay.d
+    if q.dim() != 3:
+        raise ValueError(
+            f"the multi-query kernel takes q as [HQ, Q, d]; got {tuple(q.shape)}. The single-query "
+            f"form is `krt_from_slots`.")
+    HQ, Q = q.shape[0], q.shape[1]
+    if HQ % H:
+        raise ValueError(f"HQ={HQ} is not a multiple of H={H}")
+    G = HQ // H
+    GP = triton.next_power_of_2(G)
+    if D % 32:
+        raise ValueError(f"d={D} must be a multiple of 32 for this two-half lane split")
+    if kt & (kt - 1) or br & (br - 1) or kt < 16 or br < 16:
+        raise ValueError("kt and br must be powers of two, each >= 16")
+    if bq < 1 or (bq * GP) < 16 or (bq & (bq - 1)):
+        raise ValueError(
+            f"bq={bq} with GP={GP} gives {bq * GP} rows in the contraction, and tl.dot needs a "
+            f"power of two >= 16; bq must be a power of two with bq*GP >= 16")
+
+    r1 = decoder_f.shape[0]
+    pb = packed_row_bytes(lay.res_k, lay.res_bits)
+    s = torch.empty(HQ, Q, n, device=slots.device, dtype=torch.float32)
+    # `num_stages=1` IS REQUIRED HERE, not a tuning choice. This kernel holds a `[KT, D]` fp32 key
+    # tile and a `[BQ*GP, D]` fp32 query tile live at once, and Triton's default software pipelining
+    # multiplies every `tl.dot` operand by the stage count -- at the defaults this asks for 160 KB of
+    # shared memory against this card's 101 KB and fails at launch with `OutOfResources`. One stage
+    # fits, and the loop it would have pipelined is the reconstruction over `r1`, which is short.
+    _krt_multi_kernel[(triton.cdiv(n, kt), H, triton.cdiv(Q, bq))](
+        slots, slots.view(torch.int8), decoder_f.contiguous(),
+        cos.contiguous(), sin.contiguous(), q.contiguous(), s, n, r1, Q,
+        0 if p0 is None else int(p0),
+        SLOT=lay.k_slot_bytes, ROW_OFF=lay.coeff_bytes + 2, ROW_STEP=D // 8 + pb + 2,
+        CSCALE_OFF=lay.coeff_bytes, PB=pb, D=D, HALF=D // 2, BM=D // 8,
+        H=H, HQ=HQ, G=G, GP=GP, KT=kt, BR=br, BQ=bq, RES_BITS=lay.res_bits,
+        HAS_RES=lay.res_k > 0, CAUSAL=p0 is not None,
+        num_stages=1,
+    )
+    return s
+
+
 def krt_from_slots(lay, slots, decoder_f, cos, sin, q, kt: int = 64, br: int = 32):
     """Scores `[HQ, n]` fp32, UNSCALED -- the softmax scale is the caller's, matching the shipped
     kernel and `reference.raw_scores`.

@@ -510,8 +510,13 @@ def pack_and_write(cache: torch.Tensor, slot_mapping: torch.Tensor, fk: FittedK,
     path below is what it has to reproduce, and it stays live as the fallback, as the definition of
     the format, and as the arm `VLLM_TTKV_TRITON_PACK=0` selects.
     """
-    if _fused_write(cache, slot_mapping, fk, V, lay, check):
-        return
+    # `pack.fused.total` wraps the WHOLE fused write, so the difference between it and the phases
+    # inside it is host work that no phase names. That distinction decides the fix: if the total is
+    # mostly `pack.coeff`/`pack.k`/`pack.v` the answer is fewer kernels, and if it is mostly NOT,
+    # the answer is somewhere in this function's own preamble and worth naming.
+    with prof.phase("pack.fused.total"):
+        if _fused_write(cache, slot_mapping, fk, V, lay, check):
+            return
     with prof.phase("pack.k"):
         k_slots = pack_k_slots(lay, fk.coeff_q, fk.coeff_scale, fk.resid)
     with prof.phase("pack.v"):

@@ -47,7 +47,7 @@ import time
 import torch
 
 _HERE = pathlib.Path(__file__).resolve()
-for _cand in (_HERE.parents[1] / "codec", _HERE.parents[1], _HERE.parents[2], _HERE.parents[2] / "integration",
+for _cand in (_HERE.parents[1], _HERE.parents[2], _HERE.parents[2] / "integration",
               pathlib.Path("/opt/ttkv/integration")):
     if _cand.is_dir():
         sys.path.insert(0, str(_cand))
@@ -162,14 +162,19 @@ def _phases(call, iters):
 
 
 def _fixed_cost(lay, cfg):
-    """WHERE THE WRITE'S TIME GOES, and how much of it does not scale with tokens.
+    """WHERE THE WRITE'S TIME GOES, and what it does not scale with.
 
-    The shape matters more than the total, because decode calls this ONCE PER TOKEN PER LAYER: the
-    part that does not scale is paid 28 times a step, and the arithmetic it stands for is ~9 us
-    (`encode.encode_frozen`, one token against the frozen decoder). Four measurements answer it -- host
+    The shape matters more than the total, because decode calls this ONCE PER TOKEN PER LAYER -- and
+    once per TOKEN PER LAYER PER REQUEST, which is 28*B calls a step. Four measurements answer it: host
     wall against GPU time (is the CPU or the card the limit?), the same host wall with the queue empty
     (is that number work or a wait?), the per-phase split (which host code it is), and ms/call against
     tokens per call (what a batch would amortise).
+
+    THE SWEEP IS PER CALL, NOT PER TOKEN, and that is the whole point: 28 tokens in ONE call is the
+    only row here that could ever be reached at decode, and it needs 28 tokens of the SAME LAYER --
+    same layout, same cache, same decoder. At batch 1 decode each layer has exactly one token, so the
+    reachable rows are 1 (today) and `B` (one call per layer with every request's token in it, which is
+    what the per-request loop in `impl._write_store` currently prevents).
     """
     print("\n=== the write's shape, on 1 token (decode) ===")
     fk, _chunk, V = _once(lay, cfg, 1)
@@ -182,11 +187,13 @@ def _fixed_cost(lay, cfg):
     print(f"  {'host, queue empty':34s} {empty:7.3f} ms/call"
           f"   {'-> work, not a wait' if empty > 0.6 * host else '-> mostly the queue'}")
     gpu = _gpu_ms(call, CALLS)
-    print(f"  {'gpu, from events':34s} {gpu:7.3f} ms/call -> host share {host - gpu:7.3f}")
+    print(f"  {'gpu, from events':34s} {gpu:7.3f} ms/call"
+          f"   (on a host-bound loop this is the loop period, not GPU busy time)")
     for name, ms in sorted(_phases(call, CALLS).items(), key=lambda kv: -kv[1]):
         print(f"    {name:32s} {ms:7.3f} ms/call")
-    print(f"\n  what a batch would amortise, same store:\n  {'tokens/call':>12s} {'ms/call':>9s}"
-          f" {'us/token':>9s}")
+    print(f"\n  what a batch would amortise, same store, ONE LAYER:")
+    print(f"  {'tokens/call':>12s} {'ms/call':>9s} {'us/token':>9s}"
+          f"   ('1' is decode today; 'B' is decode with the requests batched)")
     for n_tok in (1, 8, 28, 64, 256, 1082):
         fk2, _c2, V2 = _once(lay, cfg, n_tok)
         sl = (torch.arange(n_tok, dtype=torch.int32, device="cuda") * 3) % 4000

@@ -109,6 +109,43 @@ def raw_scores(lay, k_slots, decoder_f, query, cos, sin, scale=None):
     return torch.einsum("npd,pd->np", K_post[:, p_all, :], query) * scale
 
 
+def raw_scores_multi(lay, k_slots, decoder_f, query, cos, sin, scale=None, p0=None):
+    """Scores `[HQ, Q, n]` before softmax for `Q` query tokens against the same `n` stored rows.
+
+    This is the oracle for the MULTI-QUERY `krt`, and it exists because the single-query one cannot
+    express a prompt. `query` is `[HQ, Q, d]` and POST-rotary, the SAME convention the kernel takes
+    and the same order as the returned scores -- deliberately, because an oracle and a kernel that
+    disagree about axis order can still agree numerically for symmetric shapes and produce wrong
+    numbers for the shapes that matter. Every stored row is rotated by its own position, exactly as
+    in `raw_scores`, so the difference between the two functions is the query axis and nothing else.
+
+    `p0` turns on CAUSAL masking and is the absolute position of query 0, so query `j` sits at
+    `p0 + j` and may attend to rows `0 .. p0 + j`. Masked entries are `-inf` rather than zero,
+    because zero is a legitimate score and the caller's softmax would treat it as a real one.
+
+    Why the query axis is worth a separate oracle at all: the reconstruction (`r1*d` per row) does
+    not depend on the query, so a multi-query kernel reconstructs a row ONCE and reuses it for every
+    query in its block. That reuse is the entire reason this path is worth building, and it is also
+    where the indexing can go wrong -- a row reused for the wrong query still produces correctly
+    shaped, plausible scores.
+    """
+    K_pre = dense_k_from_slots(lay, k_slots, decoder_f)                    # [H, n, d]
+    H, n, d = K_pre.shape
+    HQ, Q, _ = query.shape
+    G = HQ // H
+    scale = d ** -0.5 if scale is None else scale
+    # per-ROW position again: cos is [n, d], inserted at dim 1 so it spans the head axis
+    K_post = pc.rope_apply(K_pre.permute(1, 0, 2), cos.unsqueeze(1), sin.unsqueeze(1))  # [n, H, d]
+    p_all = torch.arange(HQ, device=query.device) // G
+    # [n, HQ, d]: each query head reads its own kv head's rows
+    s = torch.einsum("hqd,phd->hqp", query, K_post[:, p_all, :]) * scale    # [HQ, Q, n]
+    if p0 is not None:
+        pos = p0 + torch.arange(Q, device=query.device)                    # [Q]
+        allow = torch.arange(n, device=query.device)[None, :] <= pos[:, None]
+        s = s.masked_fill(~allow[None, :, :], float("-inf"))
+    return s
+
+
 def attend_raw_store(lay, k_slots, v_slots, decoder_f, query, cos, sin, scale=None):
     """Reference decode. `query` is `[HQ, d]` and POST-rotary. Returns `[HQ, d]`.
 
