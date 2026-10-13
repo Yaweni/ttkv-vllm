@@ -351,6 +351,83 @@ def encode_frozen(K: torch.Tensor, kdec: KDecoder, lay: TTKLayout) -> FittedK:
                    build_resid=build_resid)
 
 
+def encode_frozen_batch(K: torch.Tensor, kdecs, lay: TTKLayout) -> list:
+    """`encode_frozen` for a whole group of requests at once: `G` requests, ONE set of launches.
+
+    WHY THIS EXISTS, and the number is the reason. `encode_frozen` is about twenty torch ops, and on
+    a DECODE step every one of them is a launch on a ONE-TOKEN tensor. At batch 8 that is 28 layers
+    x 8 requests x ~20 = ~4,480 launches a step, and the host cannot issue them fast enough -- the
+    profile reads `write.project` at 1.14 ms/step at batch 1 and **102.5 ms/step at batch 8**, a
+    12.6x growth for 8x the work, because the OP COUNT rises with the batch while the size of each op
+    does not. Batching turns `G` sequences of ~20 tiny ops into one sequence of ~20 ops on `G`x the
+    data, which is the same "fewer, larger rounds" fix the write's pack and the plan path both got.
+
+    THE GROUP MUST SHARE A TOKEN COUNT, so the caller groups by `end - start` rather than handing
+    over the step. A decode step has `n == 1` for every request, so it is ONE group; a prefill step
+    has requests of different lengths and they stay per-request (or group among themselves). That is
+    the right trade rather than a limitation: padding a 1-token request up to a 5,753-token one to
+    share a kernel would cost far more than the launches it saves.
+
+    `r1` IS THE SAME FOR EVERY MEMBER, which is what makes the batch dimension free. The layout is
+    per LAYER, so every request in this layer has the same rank budget; only the VALUES of the
+    per-request decoder differ, and those become the batch dimension of the two `bmm`s.
+
+    THE DECODER STAYS PER-REQUEST. A shared basis across a batch measured 5.8 points wrong, so this
+    batches the OPERATIONS and never the fit. `K` is `[G, H, n, d]`, stacked from the same
+    `[H, n, d]` slices `encode_frozen` takes one at a time, and the arithmetic mirrors that function
+    line for line -- including the `m = h*d + j` row convention, which a re-derivation here would
+    turn into a reported accuracy loss.
+    """
+    pc = codec()
+    G, H, n, d = K.shape
+    if (H, d) != (lay.H, lay.d):
+        raise ValueError(
+            f"K is [G={G}, H={H}, n={n}, d={d}] but the layout is for H={lay.H}, d={lay.d}")
+    if len(kdecs) != G:
+        raise ValueError(f"K holds {G} requests but {len(kdecs)} decoders were given")
+    for i, kd in enumerate(kdecs):
+        if kd.decoder_f.shape[0] != lay.r1:
+            raise ValueError(
+                f"decoder {i} has r1={kd.decoder_f.shape[0]} but the layout budgets {lay.r1}; a "
+                f"coefficient row written at one rank cannot be read at another")
+
+    M = K.permute(0, 2, 1, 3).reshape(G, n, H * d).float()          # [G, n, H*d], m = h*d + j
+    with prof.phase("proj.matmul"):
+        c = torch.bmm(M, torch.stack([kd.pinv for kd in kdecs]))    # [G, n, r1] least squares
+
+    with prof.phase("proj.quant"):
+        cscale = c.abs().amax(2, keepdim=True) / (2 ** (lay.qbits - 1) - 1)
+        cscale = torch.where(cscale == 0, torch.ones_like(cscale), cscale)
+        cq = torch.clamp(torch.round(c / cscale),
+                         -(2 ** (lay.qbits - 1)), 2 ** (lay.qbits - 1) - 1)
+
+    # THE RECONSTRUCTION IS PER REQUEST, and it is the one deliberate exception to the batching
+    # above. `bmm` and `@` select different dense kernels, so a batched reconstruction differs from
+    # the per-request one in the last bits: 1.5e-08 over 795 of 8,192 residual elements, measured.
+    # The COEFFICIENTS are unaffected -- they are quantized and the test requires them to be
+    # bit-identical -- but the residual goes to a MAGNITUDE SELECTION, where a last-bit difference
+    # is a tie-break that can move a bit in the bitmap and change stored bytes. It did not move one
+    # on any of the three shipped allocations, which is precisely why this is worth removing rather
+    # than measuring: the cost is one `@` a request against the ~20 launches a request this function
+    # exists to save, and it buys a `torch.equal` the whole way through instead of a spot check.
+    out = []
+    for g, kdec in enumerate(kdecs):
+        with prof.phase("proj.recon"):
+            kd = ((cq[g] * cscale[g]) @ kdec.decoder_f).reshape(n, H, d).permute(1, 0, 2)
+            Rg = (K[g].reshape(H, n, d).float() - kd).reshape(H * n, d)   # [H*n, d]
+
+        def build_resid(Rg=Rg):
+            with prof.phase("proj.resid"):
+                mask = torch.zeros_like(Rg, dtype=torch.bool)
+                mask.scatter_(1, torch.topk(Rg.abs(), lay.res_k, dim=1).indices, True)
+                return pc.PackedRows.build(Rg, mask, lay.res_bits, lay.d, k=lay.res_k, check=False)
+
+        out.append(FittedK(coeff_q=cq[g].to(torch.int8), coeff_scale=cscale[g].reshape(n).half(),
+                           resid=None, decoder=kdec, fitted_rank=lay.r1, budget=lay.r1,
+                           resid_src=Rg, build_resid=build_resid))
+    return out
+
+
 def encode_v(V: torch.Tensor, lay: TTKLayout):
     """V is `[H, n, d]`, RAW and unrotated, and has no basis: a V slot is self-contained.
 

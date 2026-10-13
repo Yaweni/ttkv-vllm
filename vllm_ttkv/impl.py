@@ -585,6 +585,27 @@ class TTKVAttentionImpl(AttentionImpl):
                              self.num_kv_heads, self.head_size, lay)
 
         fitted = projected = 0
+
+        def _write_one(r, fk, start, end):
+            with _phase("write.pack_and_write"):
+                # `check=False`: this step validated the whole slot mapping once (`write_slot_ids`),
+                # so the two device bounds checks here would be 2 more readbacks per layer.
+                encode.pack_and_write(cache, step.write_slot_ids(r, device), fk,
+                                      V[start:end].permute(1, 0, 2).contiguous(), lay, check=False)
+
+        # THE PROJECTIONS ARE COLLECTED BY TOKEN COUNT AND RUN ONE BATCH PER GROUP; the FITS do not
+        # batch and are not collected. Two different reasons for the two halves:
+        #
+        # A projection is ~20 launches on a one-token tensor in a decode step, so `G` of them cost
+        # `G` times the LAUNCHES for the same total work -- that is the cost this removes. A fit is
+        # one request's TT-SVD, it happens once per request ever, and it is 135 ms of real
+        # arithmetic, so there is nothing to gain by pairing it with a neighbour and a real risk in
+        # sharing a basis between requests (measured 5.8 points wrong).
+        #
+        # Grouping by `end - start` is what makes the batch legal: members must share a token count,
+        # because the batch is a stacked `[G, H, n, d]`. A decode step is one group of `n == 1`; a
+        # prefill step's requests differ in length and mostly stay per-request.
+        groups: dict = {}
         for r in range(plan.n_reqs):
             start, end = plan.qsl[r], plan.qsl[r + 1]
             if end <= start:
@@ -593,7 +614,6 @@ class TTKVAttentionImpl(AttentionImpl):
             kdec = decoder_for_request(name, key)
             # `[t, H, d]` -> `[H, t, d]`: the codec's whole K path is head-major within a token.
             Kr = K[start:end].permute(1, 0, 2)
-            Vr = V[start:end].permute(1, 0, 2)
             if kdec is None:
                 if plan.seq_lens[r] != end - start:
                     raise RuntimeError(
@@ -606,15 +626,28 @@ class TTKVAttentionImpl(AttentionImpl):
                     fk = encode.fit_into_budget(Kr.contiguous(), lay, cfg)
                 register_decoder(name, key, fk.decoder)
                 fitted += 1
+                _write_one(r, fk, start, end)
             else:
+                groups.setdefault(end - start, []).append((r, kdec))
+
+        for _n_r, members in groups.items():
+            if len(members) == 1:
+                r, kdec = members[0]
                 with _phase("write.project"):
-                    fk = encode.encode_frozen(Kr.contiguous(), kdec, lay)
+                    fk = encode.encode_frozen(
+                        K[plan.qsl[r]:plan.qsl[r + 1]].permute(1, 0, 2).contiguous(), kdec, lay)
                 projected += 1
-            with _phase("write.pack_and_write"):
-                # `check=False`: this step validated the whole slot mapping once (`write_slot_ids`),
-                # so the two device bounds checks here would be 2 more readbacks per layer.
-                encode.pack_and_write(cache, step.write_slot_ids(r, device), fk,
-                                      Vr.contiguous(), lay, check=False)
+                _write_one(r, fk, plan.qsl[r], plan.qsl[r + 1])
+                continue
+            rows = [(r, kdec, plan.qsl[r], plan.qsl[r + 1]) for r, kdec in members]
+            with _phase("write.project.batch"):
+                batch_k = torch.stack([K[s:e].permute(1, 0, 2) for _, _, s, e in rows]).contiguous()
+                fks = encode.encode_frozen_batch(batch_k, [kd for _, kd, _, _ in rows], lay)
+            projected += len(rows)
+            # Each request still writes to ITS OWN slots through its own fitted object. The batched
+            # call produced equal coefficients, not a merged store.
+            for (r, _kd, s, e), fk in zip(rows, fks):
+                _write_one(r, fk, s, e)
 
         logger.debug("vllm_ttkv: %s wrote %d tokens (%d fitted, %d projected) into %d-byte slots",
                      name, N, fitted, projected, lay.compressed_bytes_per_token())
