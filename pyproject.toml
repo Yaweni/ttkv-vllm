@@ -1,0 +1,43 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vllm-ttkv"
+version = "0.0.1"
+description = "Out-of-tree vLLM attention backend for the TT-KV compressed KV cache (pre-RoPE storage)"
+readme = "README.md"
+requires-python = ">=3.10"
+# torch only. vLLM is deliberately NOT a dependency: this package is imported BY vLLM's plugin
+# loader, and importing it must not require vLLM (the class paths are resolved lazily).
+dependencies = ["torch"]
+
+[project.optional-dependencies]
+# The test layers, and they are different layers rather than one list:
+#   unit          layout, reference, slot round-trips           -- CPU only, no model
+#   integration   the score kernels against reference.raw_scores -- needs CUDA
+#   e2e           a real transformers forward through the cache  -- CPU-able on a tiny model
+#   bdd           the acceptance criteria in features/*.feature   -- binds to all three above
+test = ["pytest>=8", "pytest-bdd>=7"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# The vendored codec, imported as a top-level module (`import ttkv_codec`). `conftest.py` at the
+# repository root does the same thing; this is the declared form, and the one that survives being run
+# from another working directory.
+pythonpath = ["codec"]
+# `--strict-markers` so a typo'd `@pytest.mark.gpu` fails loudly instead of silently marking nothing.
+addopts = "-ra --strict-markers"
+markers = [
+    "gpu: needs a CUDA device; skipped otherwise",
+    "slow: minutes rather than seconds",
+]
+
+
+# The whole out-of-tree mechanism. vLLM loads `vllm.general_plugins` entry points in EVERY
+# process (vllm/plugins/__init__.py), which is what makes a backend registerable from here.
+[project.entry-points."vllm.general_plugins"]
+register_ttkv = "vllm_ttkv:register"
+
+[tool.setuptools.packages.find]
+include = ["vllm_ttkv*"]
