@@ -39,6 +39,7 @@ import pathlib
 import sys
 import time
 
+
 _HERE = pathlib.Path(__file__).resolve()
 # The codec, for the encode. Vendored at `<repo>/codec` and imported as a top-level module, which is
 # how the original project laid it out; a clean checkout works without setting PYTHONPATH.
@@ -111,6 +112,17 @@ def _build(args):
         print(f"  calibration: {table}")
         print(f"  codec on path: {os.environ.get('PYTHONPATH', '(unset)')}")
         kw["attention_config"] = AttentionConfig(backend=AttentionBackendEnum.CUSTOM)
+
+    # A CUDA TRACE IS OFF UNLESS ASKED FOR, and it has to be configured here rather than by env var:
+    # this vLLM build refuses `start_profile()` with "Profiling is not enabled. Please set
+    # --profiler-config", so the config has to exist at construction. `tests/bench_step_kernels.py`
+    # is the caller -- it is the only way to attribute a step to KERNELS rather than to phases, and
+    # the phase table has been misread twice on this port.
+    trace_dir = getattr(args, "trace_dir", None)
+    if trace_dir:
+        from vllm.config import ProfilerConfig
+        kw["profiler_config"] = ProfilerConfig(profiler="torch",
+                                              torch_profiler_dir=str(trace_dir))
 
     return LLM(
         model=MODEL,

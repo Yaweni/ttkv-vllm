@@ -71,25 +71,28 @@ def _prompt(i: int, n: int, repeats: int) -> str:
 
 
 def _sweep_one(llm, prompts, short: int, long: int):
-    """(prefill s, decode s, DECODE TOKENS OBSERVED) for one batch, as a MARGINAL over generation
+    """(short s, decode s, DECODE TOKENS OBSERVED) for one batch, as a MARGINAL over generation
     length.
 
     Two generations of the same prompts, `short` tokens and `long` tokens, and the difference between
-    their times is the cost of `long - short` decode steps -- the prefill cancels. That matters here
-    because this port's prefill is 26x stock's, so any rate that includes it is a measurement of
-    prefill wearing a decode label.
+    their times is the cost of `long - short` decode steps -- the prefill cancels.
 
-    `ignore_eos=True` IS NOT A DETAIL, and without it this function reports nonsense rather than
-    failing. The prompts are repeated prose, so greedy decoding can emit EOS early -- in BOTH calls --
-    and then the two generations cost the same and the marginal is ~0, which divides into a rate of
-    hundreds of tokens a second or a negative one. Forcing exactly `max_tokens` also makes the token
-    count KNOWN rather than hoped for.
+    THERE ARE THREE CALLS AND THE FIRST IS THROWN AWAY, which is the third fix this instrument has
+    needed and the least obvious of them. Triton JITs a kernel the first time it sees a SHAPE, and
+    the first generation in a process pays that compile for every tile it touches. The marginal is
+    `second - first`, so a cold first call deflates it -- and by a lot, because the compile is
+    seconds. Measured: changing `krt`'s tile took one N=4 point from 21.2 s of marginal to 4.37 s
+    (234 tok/s, against a per-step cost that cannot be under ~40 ms), purely because the new tiles
+    had to compile. So the warm-up call is not politeness, it is what makes `short` and `long`
+    comparable: both are now warm and the compile is outside the measurement.
 
-    The counts are RETURNED rather than recomputed from the arguments, so a short generation shows up
-    as a small denominator instead of as a plausible wrong number. The caller prints what it got.
+    `ignore_eos=True` on all three, and the counts are RETURNED rather than recomputed from the
+    arguments -- see the module docstring. A rate computed from what was ASKED for cannot notice
+    that generation stopped early.
     """
     from vllm import SamplingParams
 
+    llm.generate(prompts, SamplingParams(temperature=0.0, max_tokens=1, ignore_eos=True))
     t0 = time.time()
     first = llm.generate(prompts,
                          SamplingParams(temperature=0.0, max_tokens=short, ignore_eos=True))

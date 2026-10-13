@@ -267,7 +267,7 @@ def _krt_multi_kernel(
 
 
 def krt_multi_from_slots(lay, slots, decoder_f, cos, sin, q, kt: int = 32, br: int = 32,
-                         bq: int = 16, p0: int | None = None):
+                         bq: int = 16, p0: int | None = None, num_warps=None):
     """Multi-query `krt`: scores `[HQ, Q, n]` fp32 for `Q` query tokens, from the same store.
 
     `q` is `[HQ, Q, d]` POST-rotary, the frame `_prefill` already holds. `p0` is the absolute position
@@ -299,8 +299,7 @@ def krt_multi_from_slots(lay, slots, decoder_f, cos, sin, q, kt: int = 32, br: i
 
     r1 = decoder_f.shape[0]
     pb = packed_row_bytes(lay.res_k, lay.res_bits)
-    s = torch.empty(HQ, Q, n, device=slots.device, dtype=torch.float32)
-    # `num_stages=1` IS REQUIRED HERE, not a tuning choice. This kernel holds a `[KT, D]` fp32 key
+    s = torch.empty(HQ, Q, n, device=slots.device, dtype=torch.float32)    # `num_stages=1` IS REQUIRED HERE, not a tuning choice. This kernel holds a `[KT, D]` fp32 key
     # tile and a `[BQ*GP, D]` fp32 query tile live at once, and Triton's default software pipelining
     # multiplies every `tl.dot` operand by the stage count -- at the defaults this asks for 160 KB of
     # shared memory against this card's 101 KB and fails at launch with `OutOfResources`. One stage
@@ -313,12 +312,13 @@ def krt_multi_from_slots(lay, slots, decoder_f, cos, sin, q, kt: int = 32, br: i
         CSCALE_OFF=lay.coeff_bytes, PB=pb, D=D, HALF=D // 2, BM=D // 8,
         H=H, HQ=HQ, G=G, GP=GP, KT=kt, BR=br, BQ=bq, RES_BITS=lay.res_bits,
         HAS_RES=lay.res_k > 0, CAUSAL=p0 is not None,
-        num_stages=1,
+        num_stages=1, **({} if num_warps is None else {"num_warps": num_warps}),
     )
     return s
 
 
-def krt_from_slots(lay, slots, decoder_f, cos, sin, q, kt: int = 64, br: int = 32):
+def krt_from_slots(lay, slots, decoder_f, cos, sin, q, kt: int = 32, br: int = 16,
+                   num_warps=None, num_stages=None):
     """Scores `[HQ, n]` fp32, UNSCALED -- the softmax scale is the caller's, matching the shipped
     kernel and `reference.raw_scores`.
 
@@ -327,6 +327,24 @@ def krt_from_slots(lay, slots, decoder_f, cos, sin, q, kt: int = 64, br: int = 3
     decoder_f:  `[r1, H*d]` fp32, ALREADY scaled (`PackedKLayer.decoder_f()`).
     cos, sin:   `[n, d]` fp32, in `rope_apply`'s frame, indexed by ABSOLUTE position.
     q:          `[HQ, d]` fp32, POST-rotary -- the kernel never rotates the query.
+
+    THE TILE DEFAULTS ARE MEASURED, and the measurement is worth recording because two plausible
+    guesses about this kernel turned out to be wrong. `tests/bench_krt_tune.py` sweeps it:
+
+    * **SMALLER TILES WIN, which is backwards from the usual amortisation argument.** `kt` sets how
+      many rows share one decoder load, so larger `kt` should help; instead n=16384 r1=110 goes
+      1.295 ms at `kt=32` to 1.411 at the old `kt=64`, and `kt=256` does not launch at all
+      (`OutOfResources: shared memory, Required: 131072, Hardware limit: 101312`). The two `[KT, HALF]`
+      fp32 accumulators grow with `kt`, so register and shared pressure dominate the decoder reuse.
+    * **The multi-query kernel is SLOWER at Q=1 despite using `tl.dot`.** This kernel contracts with
+      broadcast-and-sum because `G=4` is under `tl.dot`'s minimum of 16, building a
+      `[G, KT, HALF]` intermediate; the multi-query one pads the group axis and contracts properly.
+      At n=2048 the honest comparison is 0.247 ms against 0.418 -- so the intermediate is NOT the
+      problem and porting the dot formulation here would be a regression.
+
+    What is left is a kernel at ~15% of this card's fp32 peak, and the reason is structural rather
+    than a tile choice: `input_precision="ieee"` rules out tensor cores, and the rotation forces the
+    two-half split, so the reconstruction is two dots of N=64 instead of one of N=128.
     """
     n, H, D = slots.shape[0], lay.H, lay.d
     HQ = q.shape[0]
@@ -347,13 +365,21 @@ def krt_from_slots(lay, slots, decoder_f, cos, sin, q, kt: int = 64, br: int = 3
     if GP != G:
         qp = torch.zeros(H, GP, D, device=q.device, dtype=torch.float32)
         qp[:, :G] = q.reshape(H, G, D)
-        s = _krt_pow2(lay, slots, decoder_f, cos, sin, qp.reshape(H * GP, D), kt, br)
+        s = _krt_pow2(lay, slots, decoder_f, cos, sin, qp.reshape(H * GP, D), kt, br,
+                      num_warps, num_stages)
         return s.view(H, GP, n)[:, :G, :].reshape(HQ, n).contiguous()
-    return _krt_pow2(lay, slots, decoder_f, cos, sin, q, kt, br)
+    return _krt_pow2(lay, slots, decoder_f, cos, sin, q, kt, br, num_warps, num_stages)
 
 
-def _krt_pow2(lay, slots, decoder_f, cos, sin, q, kt: int, br: int):
-    """`krt_from_slots` for a power-of-two group size. See that function for the arguments."""
+def _krt_pow2(lay, slots, decoder_f, cos, sin, q, kt: int, br: int,
+              num_warps=None, num_stages=None):
+    """`krt_from_slots` for a power-of-two group size. See that function for the arguments.
+
+    `num_warps`/`num_stages` are for `tests/bench_krt_tune.py` and default to Triton's own choice.
+    They are worth having as knobs rather than as constants because this kernel holds TWO `[KT, HALF]`
+    fp32 accumulators plus the reconstruction operand live at once, so the right warp count is a
+    register-pressure question and not a style one.
+    """
     n, H, D = slots.shape[0], lay.H, lay.d
     HQ = q.shape[0]
     G = HQ // H
@@ -363,6 +389,12 @@ def _krt_pow2(lay, slots, decoder_f, cos, sin, q, kt: int, br: int):
     if kt & (kt - 1) or br & (br - 1) or kt < 16 or br < 16:
         raise ValueError("kt and br must be powers of two, each >= 16")
 
+    opts = {}
+    if num_warps is not None:
+        opts["num_warps"] = num_warps
+    if num_stages is not None:
+        opts["num_stages"] = num_stages
+
     pb = packed_row_bytes(lay.res_k, lay.res_bits)
     s = torch.empty(HQ, n, device=slots.device, dtype=torch.float32)
     _krt_kernel[(triton.cdiv(n, kt), H)](
@@ -371,5 +403,6 @@ def _krt_pow2(lay, slots, decoder_f, cos, sin, q, kt: int, br: int):
         SLOT=lay.k_slot_bytes, ROW_OFF=lay.coeff_bytes + 2, ROW_STEP=D // 8 + pb + 2,
         CSCALE_OFF=lay.coeff_bytes, PB=pb, D=D, HALF=D // 2, BM=D // 8,
         H=H, HQ=HQ, G=G, KT=kt, BR=br, RES_BITS=lay.res_bits, HAS_RES=lay.res_k > 0,
+        **opts,
     )
     return s
