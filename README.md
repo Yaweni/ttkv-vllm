@@ -1,9 +1,9 @@
-# vllm-ttkv — a compressed KV cache for vLLM, stored before RoPE
+# ttkv-vllm — a compressed KV cache for vLLM, stored before RoPE
 
 An out-of-tree vLLM attention backend that replaces the KV cache with a tensor-train store. Each
 layer fits a small decoder to the prompt once; every token's key is then stored against that decoder
 as a few coefficients, a bitmap, and a residual. Keys are stored **before** the rotation (pre-RoPE),
-which is the whole ratio argument: a pre-rotary key is far more compressible than a post-rotary one.
+which is the ratio argument: a pre-rotary key is more compressible than a post-rotary one.
 
 This repository is the vLLM integration: the format, the kernels, the plugin, the tests, and the
 measurements — including the ones that went against us.
@@ -12,13 +12,13 @@ measurements — including the ones that went against us.
 
 **It works.** It serves `meta-llama/Llama-3.2-3B` through vLLM end to end on the stock scheduler,
 paged cache, and sampling path. Greedy output matches the uncompressed arm for the first 12 of 16
-tokens (the cache is lossy, so a divergence after a while is expected rather than a bug). The store
-is byte-exact against the reference container. 74 tests pass in the kernel environment and 93 in the
+tokens (the cache is lossy, so a divergence after a while is expected rather than a bug). The store is
+byte-exact against the reference container. 74 tests pass in the kernel environment and 93 in the
 vLLM environment (two files need a CUDA toolkit or the BDD runner and are run separately; a few
 model-dependent tests skip without a Hugging Face cache).
 
-**Accuracy is the strong result.** RULER, `meta-llama/Llama-3.2-3B`, dense and 4-bit storage, 4k and
-16k context. `safe` is the 4.53x allocation, `tight` the 6.42x one:
+**Accuracy is the strong result.** RULER on Llama-3.2-3B, at 4k and 16k context, in fp16 and 4-bit
+storage. `safe` is the 4.53x allocation, `tight` the 6.42x one:
 
 | RULER score | 4k fp16 | 4k 4-bit | 16k fp16 | 16k 4-bit |
 | --- | --- | --- | --- | --- |
@@ -32,27 +32,35 @@ model-dependent tests skip without a Hugging Face cache).
 
 Read that as: at 4.53x compression `safe` stays within ~1 point of uncompressed at 4k, and within
 ~1.9 points at 16k once one outlier task is excluded. **4-bit storage costs it under a point**
-(91.58 → 90.64), which is the result we did not expect and the one worth the most. At 6.42x, `tight`
-holds at 4k but drops ~10 points at 16k — that is a cliff, not a slope, and it is the honest limit of
-the current tuning.
+(91.58 -> 90.64), which is the result we did not expect and the one worth the most. At 6.42x, `tight`
+holds at 4k but drops ~10 points at 16k — a cliff, not a slope, and the honest limit of the current
+tuning.
 
-**Speed is the open problem, and it is real.** Decode is about **3.8x slower** than stock vLLM at the
-same context, and prefill about **26x slower** at 1082 tokens (that prefill ratio improves to ~1.6x at
-16k, because ours is flat in prompt length and stock's grows). Section 4 has the full diagnosis. The
-short version: we are not slow because our kernels are bad, but because the port does **28 rounds of
-small per-layer work** where stock does one large kernel per layer. Three separate measurements back
-that up, and each one killed the explanation we started with — a CUDA kernel that turned out to be
-*slower* than the Triton one at most of this model's ranks, CUDA graphs worth only 14%, and a read
-path whose cost is the count of operations rather than their quality.
+**Speed is the open problem, and it is real.** Decode is **3.8x slower** than stock at 1082 tokens, and
+the gap WIDENS with context. Measured decode steps: 34.6 / 56.5 / 87.5 / 124.4 ms at 1082 / 4322 /
+8642 / 14402 tokens, against stock's 19.4 / 21.2 / 21.9 / 23.5 — so 1.8x, 2.7x, 4.0x, and **5.3x
+slower**. Ours grows at **6.7 us per cached token per step**, stock's at 0.31, and that slope, not any
+fixed overhead, is what long context becomes. Prefill is ~26x slower at 1082 tokens and ~4.5x at 14402
+(ours ~3.5 s fixed plus ~0.48 us a token; stock's ~0.16 us a token).
+
+**And the widening slope is inherent to the format, not to our kernels.** Reconstructing a key costs
+`r1*d` multiply-adds per cached row per step where a dense read costs `d`, so the arithmetic ratio is
+about `r1/(1+G)` = 110/4 ~ 27x — and it does **not** amortise with batch size, because each request's
+rows are reached by exactly one query token per step. It amortises only with many query tokens per
+cached row: prefill and chunked prefill, where the ratio becomes `r1/((1+G)*Q)` and at Q=2048 is a 75x
+advantage. So single-stream decode is the regime this format is worst at, and query-dense work is where
+it wins — which is also where the port is currently weakest, since the prefill path is still the torch
+`attend_prefill`. A fast prefill kernel is where the next effort pays, not the decode kernel.
 
 **Capacity is not yet the win it should be.** The format is 4.53x, but vLLM sizes the cache from its
 peak-memory profiling pass and the fit's temporary buffers get charged against us permanently, so the
-*realised* capacity is 1.74x against stock — behind in-tree fp8 (8.77x). Fixing that accounting is
-the single highest-value piece of work here, because it is the difference between a token-efficiency
-argument and a cache-size one.
+realised capacity is 1.74x against stock — behind in-tree fp8 (8.77x). Fixing that accounting is the
+highest-value single piece of work here.
 
-**Where to start reading.** `vllm_ttkv/layout.py` (the format), `vllm_ttkv/rope_store.py` (the
-pre-RoPE mechanism, and the crux of the whole design), then §4 of this file for the measurements.
+**Where to start reading.** `vllm_ttkv/layout.py` (the format), `vllm_ttkv/rope_store.py` (the pre-RoPE
+mechanism, the crux of the design), then the measurements section of this file — which records three
+hypotheses that the numbers killed, including two claims that an earlier version of this file made and
+that turned out to be wrong.
 
 ## Repository layout
 
@@ -68,6 +76,21 @@ pre-RoPE mechanism, and the crux of the whole design), then §4 of this file for
 Run the tests with `python -m pytest`; the benchmarks are `tests/bench_*.py` and are not collected by
 pytest. Every environment variable the port uses is documented where it is read.
 
+---
+
+# vllm-ttkv — out-of-tree vLLM backend for a pre-rotary TT-KV cache
+
+### The design, in depth
+
+**Status of this section.** Finished and tested: `layout.py`, `reference.py`, and the `krt` score kernel
+in both forms (`krt_triton.py`, and the shipped CUDA kernel through `tests/test_kernel_krt.py`). The
+`NotImplementedError`s that remain are deliberate refusals — places where the alternative was a
+plausible wrong answer — not unfinished work: the port serves end to end (see the status above).
+Everything that touches vLLM's API is written to the real symbols. It is meant to be read, and to make
+the decisions visible.
+
+Read this file first, then `vllm_ttkv/layout.py` (the design), then `vllm_ttkv/rope_store.py`
+(the crux).
 
 ---
 
@@ -823,12 +846,30 @@ and the sweep that says what batching buys (same store, same sizes):
 | 256 | 0.395 | 1.5 |
 | 1082 | 0.785 | 0.7 |
 
-**28 tokens in one call costs 0.351 ms.** So the whole step's writes -- 28 layers, one token each --
-could cost 0.35 ms instead of ~9.7, i.e. **~9 ms/step**, and the projection amortises the same way
-(`encode_frozen` measures 0.264 ms at one token against 0.196 at 1082, so it too is fixed-cost
-dominated): ~17 ms/step of a ~64 ms decode step is one token per call. Getting it means the store
-lags by one token -- attention adds the newest token's score and V term directly, from a 2 KB/layer
-raw side buffer -- which is a change to the read path, not to this one.
+**The sweep is per CALL, and that is the number that matters — with one correction to how it was
+first read here.** A batch of 28 tokens costs 0.351 ms against 0.321 for 1, so a call's cost is
+almost entirely fixed. But that fixed cost is only amortisable when the tokens in the call belong to
+**the same layer**: same layout, same slot width, same cache, same decoder. At decode, batch 1, each
+layer has exactly one token, and the 28 layers of a step do NOT share a layout — the calibrated `r1`
+runs 14 .. 143 across them, so their slot widths differ and they write to 28 different caches. So
+"batch the 28 layers into one call" is not available, and the earlier version of this paragraph
+claimed `~9 ms/step` from it, which was wrong.
+
+What IS available, and is larger, is batching across REQUESTS. `impl._write_store` loops
+`for r in range(plan.n_reqs)` and calls `pack_and_write` once per request, so a step makes
+`28 x B` calls:
+
+| batch | write calls per step | ms/step for the write at 0.25 ms/call | if batched across requests |
+| --- | --- | --- | --- |
+| 1 | 28 | 6.9 | 6.9 (nothing to batch) |
+| 8 | 224 | **55** | ~7.2 (28 calls of 8 tokens) |
+| 16 | 448 | **110** | ~7.4 |
+
+That is the number to act on, and it is a *concurrency* result rather than a single-stream one: at
+batch 1 there is nothing to amortise, and at batch 8 the write alone is 55 ms of a step. It needs the
+requests' residuals and V concatenated into one call per layer — the layout is per layer, so no kernel
+change is needed — and it is currently blocked behind batch sizes above 1, which the prefill branch
+refuses until a multi-query `krt` exists.
 
 Two loose ends worth their own measurement before any of that: the ~0.15 ms a call that is outside
 every phase (four times the launch it pays for), and the fact that `encode_frozen` at one token is
@@ -951,6 +992,50 @@ fewer, larger rounds -- the write batched across layers is measured at 0.35 ms f
 9.7 for 1-at-a-time, and the read has never had the fusion the write got. This is a count-of-operations
 problem, not a kernel-quality one, and it is the same finding from three directions now (the write
 path, the plan path, and the A/B that priced CUDA graphs at only +14%).
+
+### Decode against context, in the engine: the phase table was wrong
+
+`tests/bench_decode_vs_context.py` measures the one number the whole long-context question rests on,
+and it settles an argument that the two instruments had been having. For each context it runs two
+generations of the same prompt (`max_tokens=1` and `1+GAP`) and takes the difference over `GAP`, so
+prefill cancels and only decode steps are timed. A4000, Llama-3.2-3B, batch 1, `safe`:
+
+| prompt tokens | ours ms/step | ours tok/s | stock ms/step | stock tok/s | ratio |
+| --- | --- | --- | --- | --- | --- |
+| 1082 | 34.6 | 28.9 | 19.4 | 51.6 | 1.8x |
+| 4322 | 56.5 | 17.7 | 21.2 | 47.3 | 2.7x |
+| 8642 | 87.5 | 11.4 | 21.9 | 45.7 | 4.0x |
+| 14402 | 124.4 | 8.0 | 23.5 | 42.5 | **5.3x** |
+| | **+6.7 us/cached token** | | **+0.31 us/cached token** | | |
+
+**The disagreement is resolved against the phase table, and it was never close.** `decode_total` looked
+flat in context; the wall clock says our step grows 6.7 us per cached token, i.e. 0.24 us a token a
+layer, which is the same order as the 0.36 the isolated kernel bench measured. A phase times the host
+ISSUING an async kernel group, so a compute-bound read looks free in the table while its cost lands in
+the step's wall clock — the same trap the write path demonstrated. Every "our read is flat" statement
+in this file before this section was wrong, and the prefill statement was too: prefill is not flat in
+prompt length either (ours ~3.5 s fixed plus ~0.48 us a token, stock's ~0.16), so the prefill ratio is
+26x at 1082 tokens and 4.5x at 14402, not the ~1.6x an earlier version of this file claimed.
+
+**And the widening slope is inherent to the format, which is the part worth sitting with.** Reading one
+cached token costs us `r1*d` multiply-adds per KV head to reconstruct the key, and costs dense `d` to
+read plus `G*d` to dot. The arithmetic ratio is therefore about `r1/(1+G)` — 110/4, ~27x for this
+model — and it does **not** improve with batch size, because at decode each request's cached rows are
+reached by exactly one query token per step. Amortisation needs many query tokens per cached row, i.e.
+a `Q` greater than `r1/(1+G)`: prefill, and chunked prefill. There the ratio becomes `r1/((1+G)*Q)`,
+which at Q=2048 is a 75x *advantage*. So:
+
+* **single-stream decode is the regime this format is worst at**, and no kernel quality fixes it: even
+  at 80% of fp32 peak the reconstruction is ~0.43 us a token a step, which at 16k is ~41 ms against
+  stock's ~24, i.e. still ~1.7x slower. Today we are at ~5-10% of peak, so there is real ground to
+  gain, but not to a win;
+* **query-dense work is the regime it wins at**, and that is also where the port is currently weakest —
+  `_prefill` is the torch `attend_prefill` and costs 4.5x stock. That, not the decode kernel, is where
+  the next engineering effort pays.
+
+This is worth stating plainly because it changes the pitch: the honest claims are a 4.53x smaller cache
+and better accuracy per byte, with speed arriving in prefill and batched regimes rather than in
+single-stream decode.
 
 ### The rank budget, measured as an accuracy cost
 
